@@ -13,8 +13,8 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 os.environ["SMART_PDF_ADMIN_USER"] = "test-admin"
-os.environ["SMART_PDF_ADMIN_PASSWORD"] = "test-password-long"
-os.environ["OCR_API_KEY"] = "test-api-key-long"
+os.environ["SMART_PDF_ADMIN_PASSWORD"] = "test-password-long"  # pragma: allowlist secret
+os.environ["OCR_API_KEY"] = "test-api-key-long"  # pragma: allowlist secret
 os.environ["CORS_ORIGINS"] = "https://smartpdf.example.test"
 os.environ["COOKIE_SECURE"] = "true"
 os.environ["ENABLE_API_DOCS"] = "false"
