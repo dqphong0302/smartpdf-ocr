@@ -24,13 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/setup@v1
         with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
+          version: 11.0.9
+          runtime: node@22
+          cache: true
+          install: false
           cache-dependency-path: |
             frontend/pnpm-lock.yaml
             mcp-server/pnpm-lock.yaml
