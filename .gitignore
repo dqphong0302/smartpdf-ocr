@@ -23,6 +23,9 @@ backend/data/
 node_modules/
 dist/
 .cache/
+.pytest_cache/
+.ruff_cache/
+uv.lock
 
 # ── macOS ─────────────────────────────────────────────────
 .DS_Store
@@ -38,3 +41,7 @@ dist/
 # ── SQLite ────────────────────────────────────────────────
 *.sqlite3
 *.db
+
+# ── Local-only test helpers ───────────────────────────────
+scripts/test_image_extraction.py
+scripts/create_ui_test_job.py

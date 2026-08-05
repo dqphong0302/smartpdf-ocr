@@ -1,7 +1,8 @@
 """PDF Analyzer — Detect digital vs scanned pages, classify complexity."""
-import fitz  # PyMuPDF
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
+
+import fitz  # PyMuPDF
 
 logger = logging.getLogger("uvicorn")
 
@@ -159,8 +160,9 @@ def analyze_pdf(filepath: str) -> PdfAnalysis:
 
 def render_page_to_image(filepath: str, page_num: int, dpi: int = 200):
     """Render a PDF page to PIL Image for OCR."""
-    from PIL import Image
     import io
+
+    from PIL import Image
 
     doc = fitz.open(filepath)
     page = doc[page_num - 1]  # 0-indexed
@@ -236,7 +238,6 @@ def extract_page_images(filepath: str, page_num: int, output_dir: str) -> list[s
     Filters out tiny images (width/height < 30px) to avoid cluttering with icons.
     Returns a list of saved filenames.
     """
-    import os
     from pathlib import Path
     
     doc = fitz.open(filepath)

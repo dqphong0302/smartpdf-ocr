@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import DOMPurify from 'dompurify'
 
 const API = ''  // proxy handles it
 
@@ -878,7 +879,7 @@ export default function App() {
                         <div
                           className="preview-text-content"
                           style={{ fontFamily: 'Georgia, serif', whiteSpace: 'normal' }}
-                          dangerouslySetInnerHTML={{ __html: currentResult.html_text }}
+                          dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(currentResult.html_text) }}
                         />
                       ) : (
                         <div className="preview-text-content">

@@ -1,20 +1,21 @@
 """Job Manager — In-memory cache + SQLite persistence with WebSocket broadcast."""
-import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-
-from fastapi import WebSocket
+from enum import StrEnum
 
 from database import (
-    init_db, save_job, save_page_result,
-    load_job_dict, list_jobs_from_db, delete_job_from_db,
+    delete_job_from_db,
+    init_db,
+    list_jobs_from_db,
+    load_job_dict,
+    save_job,
+    save_page_result,
 )
+from fastapi import WebSocket
 
 
-class JobStatus(str, Enum):
+class JobStatus(StrEnum):
     UPLOADED = "uploaded"
     ANALYZING = "analyzing"
     PROCESSING = "processing"
@@ -22,14 +23,14 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
-class PageMethod(str, Enum):
+class PageMethod(StrEnum):
     DIGITAL = "digital"
     TESSERACT = "tesseract"
     VISION = "vision"
     SKIPPED = "skipped"
 
 
-class PageStatus(str, Enum):
+class PageStatus(StrEnum):
     PENDING = "pending"
     ANALYZING = "analyzing"
     PROCESSING = "processing"
@@ -42,12 +43,12 @@ class PageResult:
     page_num: int
     status: PageStatus = PageStatus.PENDING
     classification: str = ""  # digital, scan_simple, scan_complex
-    method: Optional[str] = None
+    method: str | None = None
     text: str = ""
     html_text: str = ""  # HTML-formatted OCR output
     confidence: float = 0.0
     time_taken: float = 0.0
-    error: Optional[str] = None
+    error: str | None = None
 
     def to_dict(self):
         return {
@@ -73,9 +74,9 @@ class Job:
     selected_pages: list = field(default_factory=list)
     pages: dict = field(default_factory=dict)  # page_num -> PageResult
     created_at: float = field(default_factory=time.time)
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    error: Optional[str] = None
+    started_at: float | None = None
+    completed_at: float | None = None
+    error: str | None = None
 
     def to_dict(self, include_text: bool = False):
         pages_data = {}
@@ -140,11 +141,11 @@ class JobManager:
         save_job(job)
         return job
 
-    def get_job(self, job_id: str) -> Optional[Job]:
+    def get_job(self, job_id: str) -> Job | None:
         """Get from in-memory cache (active jobs only)."""
         return self._jobs.get(job_id)
 
-    def get_job_dict(self, job_id: str, include_text: bool = False) -> Optional[dict]:
+    def get_job_dict(self, job_id: str, include_text: bool = False) -> dict | None:
         """Get job as dict — tries in-memory first, falls back to SQLite."""
         job = self._jobs.get(job_id)
         if job:

@@ -1,0 +1,13 @@
+[Unit]
+Description=Clean expired SmartPDF OCR runtime files
+
+[Service]
+Type=oneshot
+User=smartpdf
+Group=smartpdf
+ExecStart=/opt/smart-pdf/scripts/cleanup-old-files.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/smart-pdf/backend/data /opt/smart-pdf/backend/uploads

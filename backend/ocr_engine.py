@@ -5,10 +5,11 @@ import io
 import os
 import time
 
+import bleach
 import httpx
 import pytesseract
-from PIL import Image
 from dotenv import load_dotenv
+from PIL import Image
 
 load_dotenv()
 
@@ -32,6 +33,25 @@ NINE_ROUTER_URL = os.getenv("NINE_ROUTER_URL", "http://10.10.10.100:8317/v1")
 NINE_ROUTER_API_KEY = os.getenv("NINE_ROUTER_API_KEY", "")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4-mini")
 TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng+vie")
+
+ALLOWED_HTML_TAGS = {
+    "div", "span", "p", "pre", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "ul", "ol", "li",
+    "strong", "b", "em", "i", "blockquote", "code", "hr",
+}
+ALLOWED_HTML_ATTRIBUTES = {"*": ["class", "title", "lang", "dir"], "td": ["colspan", "rowspan"], "th": ["colspan", "rowspan"]}
+
+
+def sanitize_ocr_html(value: str) -> str:
+    """Remove executable markup from OCR/model output before storage or rendering."""
+    return bleach.clean(
+        value or "",
+        tags=ALLOWED_HTML_TAGS,
+        attributes=ALLOWED_HTML_ATTRIBUTES,
+        protocols=[],
+        strip=True,
+        strip_comments=True,
+    )
 
 
 def _hocr_to_styled_html(hocr: str) -> str:
@@ -58,7 +78,7 @@ def tesseract_ocr(image: Image.Image, lang: str = None) -> dict:
     # Get hOCR (HTML) output for layout-preserving render
     try:
         hocr_bytes = pytesseract.image_to_pdf_or_hocr(image, lang=lang, extension='hocr')
-        html_text = hocr_bytes.decode('utf-8', errors='replace')
+        html_text = sanitize_ocr_html(hocr_bytes.decode('utf-8', errors='replace'))
     except Exception:
         html_text = f"<pre>{text}</pre>"
 
@@ -73,13 +93,12 @@ def tesseract_ocr(image: Image.Image, lang: str = None) -> dict:
     }
 
 
-async def vision_ocr(image: Image.Image, prompt: str = None) -> dict:
+async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
     """Run Vision AI OCR via 9router.
     
     HTML-first approach: one API call for HTML, derive plain text from it.
     """
-    async with get_vision_semaphore():
-        start = time.time()
+    start = time.time()
 
     # Convert image to base64
     buffer = io.BytesIO()
@@ -130,7 +149,7 @@ async def vision_ocr(image: Image.Image, prompt: str = None) -> dict:
 
     html_text = data["choices"][0]["message"]["content"].strip()
     # Strip markdown code block wrappers if present
-    html_text = _strip_code_block(html_text)
+    html_text = sanitize_ocr_html(_strip_code_block(html_text))
     
     # Derive plain text from HTML
     text = _html_to_text(html_text)
@@ -145,6 +164,11 @@ async def vision_ocr(image: Image.Image, prompt: str = None) -> dict:
         "method": "vision",
         "tokens_used": usage.get("total_tokens", 0),
     }
+
+
+async def vision_ocr(image: Image.Image, prompt: str = None) -> dict:
+    async with get_vision_semaphore():
+        return await _vision_ocr_unlimited(image, prompt)
 
 
 def _strip_code_block(text: str) -> str:
@@ -183,7 +207,7 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
-async def vision_ocr_batch(images: list[tuple[int, Image.Image]]) -> list[dict]:
+async def _vision_ocr_batch_unlimited(images: list[tuple[int, Image.Image]]) -> list[dict]:
     """Batch Vision AI OCR: send multiple page images in ONE API call.
     
     HTML-first approach: requests HTML output, derives text from it.
@@ -195,11 +219,9 @@ async def vision_ocr_batch(images: list[tuple[int, Image.Image]]) -> list[dict]:
         list of result dicts, one per page, in input order
     """
     if len(images) == 1:
-        result = await vision_ocr(images[0][1])
+        result = await _vision_ocr_unlimited(images[0][1])
         return [result]
-
-    async with get_vision_semaphore():
-        start = time.time()
+    start = time.time()
 
     # Build multi-image content with HTML output instruction
     content_parts = [
@@ -219,7 +241,7 @@ async def vision_ocr_batch(images: list[tuple[int, Image.Image]]) -> list[dict]:
         }
     ]
 
-    for page_num, image in images:
+    for _page_num, image in images:
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         img_b64 = base64.b64encode(buffer.getvalue()).decode()
@@ -254,13 +276,13 @@ async def vision_ocr_batch(images: list[tuple[int, Image.Image]]) -> list[dict]:
 
         # Split by page break marker
         parts = full_output.split("===PAGE_BREAK===")
-        parts = [_strip_code_block(p.strip()) for p in parts if p.strip()]
+        parts = [sanitize_ocr_html(_strip_code_block(p.strip())) for p in parts if p.strip()]
 
         # If splitting didn't produce the right count, fallback
         if len(parts) != len(images):
             results = []
             for _, image in images:
-                r = await vision_ocr(image)
+                r = await _vision_ocr_unlimited(image)
                 results.append(r)
             return results
 
@@ -282,9 +304,14 @@ async def vision_ocr_batch(images: list[tuple[int, Image.Image]]) -> list[dict]:
         # Fallback: process individually
         results = []
         for _, image in images:
-            r = await vision_ocr(image)
+            r = await _vision_ocr_unlimited(image)
             results.append(r)
         return results
+
+
+async def vision_ocr_batch(images: list[tuple[int, Image.Image]]) -> list[dict]:
+    async with get_vision_semaphore():
+        return await _vision_ocr_batch_unlimited(images)
 
 
 async def smart_ocr(
