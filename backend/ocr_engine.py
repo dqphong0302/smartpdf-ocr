@@ -29,10 +29,15 @@ def get_tesseract_semaphore():
     return _semaphores["tesseract"]
 
 CONFIDENCE_THRESHOLD = int(os.getenv("CONFIDENCE_THRESHOLD", "80"))
-NINE_ROUTER_URL = os.getenv("NINE_ROUTER_URL", "http://10.10.10.100:8317/v1")
+NINE_ROUTER_URL = os.getenv("NINE_ROUTER_URL", "").rstrip("/")
 NINE_ROUTER_API_KEY = os.getenv("NINE_ROUTER_API_KEY", "")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4-mini")
 TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng+vie")
+
+
+def _require_vision_config() -> None:
+    if not NINE_ROUTER_URL or not NINE_ROUTER_API_KEY:
+        raise RuntimeError("Vision OCR is not configured; set its gateway URL and API key at runtime")
 
 ALLOWED_HTML_TAGS = {
     "div", "span", "p", "pre", "br", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -98,6 +103,7 @@ async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
     
     HTML-first approach: one API call for HTML, derive plain text from it.
     """
+    _require_vision_config()
     start = time.time()
 
     # Convert image to base64
@@ -218,6 +224,9 @@ async def _vision_ocr_batch_unlimited(images: list[tuple[int, Image.Image]]) -> 
     Returns:
         list of result dicts, one per page, in input order
     """
+    if not images:
+        return []
+    _require_vision_config()
     if len(images) == 1:
         result = await _vision_ocr_unlimited(images[0][1])
         return [result]
