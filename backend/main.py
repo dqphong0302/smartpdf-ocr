@@ -1394,7 +1394,7 @@ def collect_health() -> tuple[str, dict]:
         "uploads": {"ok": upload_writable, "error": upload_error},
         "tesseract": {"ok": bool(tesseract_path)},
         "vision": {
-            "ok": bool(os.getenv("NINE_ROUTER_API_KEY")),
+            "ok": bool(os.getenv("NINE_ROUTER_URL") and os.getenv("NINE_ROUTER_API_KEY")),
             "model": os.getenv("VISION_MODEL", ""),
         },
         "latex": {
