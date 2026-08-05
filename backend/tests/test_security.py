@@ -19,7 +19,6 @@ os.environ["CORS_ORIGINS"] = "https://smartpdf.example.test"
 os.environ["COOKIE_SECURE"] = "true"
 os.environ["ENABLE_API_DOCS"] = "false"
 os.environ["LATEX_COMPILE_ENABLED"] = "false"
-os.environ.setdefault("COOKIE_SECURE", "true")
 
 import auth
 import database
