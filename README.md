@@ -214,9 +214,15 @@ one hour after completion; persist downloaded results in the calling workflow.
 
 ## MCP server
 
+The MCP adapter uses stdio, strict schemas, structured output, bounded file
+access, request timeouts, and capability-based tool exposure. See the complete
+[MCP setup, security, tool-contract, and troubleshooting guide](mcp-server/MCP_GUIDE.md).
+
 ```bash
 cd mcp-server
 pnpm install --frozen-lockfile
+pnpm check
+pnpm test
 SMART_OCR_URL="${SMARTPDF_URL}" \
 SMART_OCR_API_KEY="${SMARTPDF_API_KEY}" \
 node index.js
@@ -225,6 +231,10 @@ node index.js
 Set `SMART_OCR_USERNAME` and `SMART_OCR_PASSWORD` through the MCP client's private
 environment only if `ocr_jobs` needs session-authenticated UI history. API-only
 OCR tools need `SMART_OCR_API_KEY`, not the administrator password.
+
+For least privilege, configure `SMART_OCR_ALLOWED_ROOTS` and optionally
+`SMART_OCR_ENABLED_TOOLS`. Never commit MCP client configuration containing
+credentials, internal test PDFs, or downloaded OCR results.
 
 ## Production deployment with systemd
 
@@ -321,7 +331,8 @@ pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend build
 
 pnpm --dir mcp-server install --frozen-lockfile
-node --check mcp-server/index.js
+pnpm --dir mcp-server check
+pnpm --dir mcp-server test
 ```
 
 Optional dependency audits:

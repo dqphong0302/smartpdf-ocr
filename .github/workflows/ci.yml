@@ -39,5 +39,7 @@ jobs:
         working-directory: frontend
       - run: pnpm install --frozen-lockfile
         working-directory: mcp-server
-      - run: node --check index.js
+      - run: pnpm check
+        working-directory: mcp-server
+      - run: pnpm test
         working-directory: mcp-server
