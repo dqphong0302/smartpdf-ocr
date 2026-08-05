@@ -26,7 +26,7 @@ async function makeTempDir(t) {
 test("loadConfig validates authentication, paths, limits, and explicit tools", () => {
   const config = loadConfig({
     SMART_OCR_URL: "https://ocr.example.test///?ignored=true",
-    SMART_OCR_API_KEY: "test-placeholder",
+    SMART_OCR_API_KEY: "test-placeholder", // pragma: allowlist secret
     SMART_OCR_ALLOWED_ROOTS: "/tmp,/var/tmp",
     SMART_OCR_MAX_FILE_MB: "12",
     SMART_OCR_MAX_BATCH_FILES: "25",
@@ -56,9 +56,9 @@ test("loadConfig validates authentication, paths, limits, and explicit tools", (
 test("MCP handshake exposes strict schemas, structured output, and annotations", async (t) => {
   const config = loadConfig({
     SMART_OCR_URL: "https://ocr.example.test",
-    SMART_OCR_API_KEY: "test-placeholder",
+    SMART_OCR_API_KEY: "test-placeholder", // pragma: allowlist secret
     SMART_OCR_USERNAME: "admin",
-    SMART_OCR_PASSWORD: "test-placeholder",
+    SMART_OCR_PASSWORD: "test-placeholder", // pragma: allowlist secret
   });
   const fetchImpl = async (url) => {
     if (url.endsWith("/api/health")) return jsonResponse({ status: "ok", service: "smart-pdf" });
@@ -110,7 +110,7 @@ test("API-key job status and download never fall through to session endpoints", 
   };
   const config = loadConfig({
     SMART_OCR_URL: "https://ocr.example.test",
-    SMART_OCR_API_KEY: "test-placeholder",
+    SMART_OCR_API_KEY: "test-placeholder", // pragma: allowlist secret
     SMART_OCR_ALLOWED_ROOTS: directory,
   });
   const runtime = createRuntime(config, { fetchImpl });
@@ -146,7 +146,7 @@ test("batch submit validates files and splits more than ten PDFs", async (t) => 
   };
   const config = loadConfig({
     SMART_OCR_URL: "https://ocr.example.test",
-    SMART_OCR_API_KEY: "test-placeholder",
+    SMART_OCR_API_KEY: "test-placeholder", // pragma: allowlist secret
     SMART_OCR_ALLOWED_ROOTS: directory,
   });
   const runtime = createRuntime(config, { fetchImpl });
@@ -166,7 +166,7 @@ test("filesystem guard blocks traversal through symlinks and unsafe output names
   await fs.symlink(outsidePdf, linkPdf);
 
   const config = loadConfig({
-    SMART_OCR_API_KEY: "test-placeholder",
+    SMART_OCR_API_KEY: "test-placeholder", // pragma: allowlist secret
     SMART_OCR_ALLOWED_ROOTS: allowed,
   });
   const runtime = createRuntime(config, {
