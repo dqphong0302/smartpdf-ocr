@@ -12,12 +12,14 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-os.environ.setdefault("SMART_PDF_ADMIN_USER", "test-admin")
-os.environ.setdefault("SMART_PDF_ADMIN_PASSWORD", "test-password-long")
-os.environ.setdefault("OCR_API_KEY", "test-api-key-long")
-os.environ.setdefault("CORS_ORIGINS", "https://smartpdf.example.test")
-os.environ.setdefault("ENABLE_API_DOCS", "false")
-os.environ.setdefault("LATEX_COMPILE_ENABLED", "false")
+os.environ["SMART_PDF_ADMIN_USER"] = "test-admin"
+os.environ["SMART_PDF_ADMIN_PASSWORD"] = "test-password-long"
+os.environ["OCR_API_KEY"] = "test-api-key-long"
+os.environ["CORS_ORIGINS"] = "https://smartpdf.example.test"
+os.environ["COOKIE_SECURE"] = "true"
+os.environ["ENABLE_API_DOCS"] = "false"
+os.environ["LATEX_COMPILE_ENABLED"] = "false"
+os.environ.setdefault("COOKIE_SECURE", "true")
 
 import auth
 import database

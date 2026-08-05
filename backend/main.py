@@ -81,7 +81,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in {"1", "true", "yes", "on"}
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes", "on"}
 COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "lax")
 CORS_ORIGINS = [
     origin.strip()
