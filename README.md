@@ -29,23 +29,19 @@ content and layout.
 
 ## Processing pipeline
 
-```mermaid
-flowchart LR
-    A["Upload PDF"] --> B["Inspect each page"]
-    B -->|"Born-digital"| C["pdf-inspector / PyMuPDF"]
-    B -->|"Simple scan"| D["Local Tesseract OCR"]
-    B -->|"Complex scan"| E["Vision AI batch"]
-    C --> F["Sanitize and assemble output"]
-    D --> F
-    E --> F
-    F --> G["Preview and download"]
+```text
+Upload PDF
+    └─ Inspect each page
+       ├─ Born-digital ──> pdf-inspector / PyMuPDF ─┐
+       ├─ Simple scan ───> Local Tesseract OCR ─────┼─> Sanitize ─> Preview / download
+       └─ Complex scan ──> Vision AI batch ─────────┘
 ```
 
 | Page type | Default method | Network/API cost |
-|---|---|---|
+| --- | --- | --- |
 | Born-digital text | `pdf-inspector` + PyMuPDF | None |
 | Simple scanned page | Tesseract | None |
-| Complex layout or low-confidence scan | OpenAI-compatible Vision model | Optional API usage |
+| Complex or low-confidence scan | Vision model | Optional API usage |
 
 ## Features
 
@@ -64,7 +60,7 @@ flowchart LR
 ## Technology
 
 | Layer | Components |
-|---|---|
+| --- | --- |
 | Backend | Python 3.12, FastAPI, PyMuPDF, pdf-inspector, pytesseract, mistune |
 | Frontend | React 19, Vite 8, DOMPurify, pnpm |
 | Agent integration | Node.js MCP stdio server |
@@ -137,11 +133,11 @@ secret manager.
 ### OCR and Vision
 
 | Variable | Purpose |
-|---|---|
+| --- | --- |
 | `TESSERACT_LANG` | Tesseract languages, such as `eng+vie` |
 | `CONFIDENCE_THRESHOLD` | Confidence below which auto mode may use Vision |
-| `NINE_ROUTER_URL` | Base URL of an OpenAI-compatible `/v1` endpoint |
-| `NINE_ROUTER_API_KEY` | Private Vision credential; leave unset for local-only use |
+| `OPENAI_BASE_URL` | Base URL of an OpenAI-compatible `/v1` endpoint |
+| `OPENAI_API_KEY` | Private Vision credential; leave unset for local-only use |
 | `VISION_MODEL` | Vision-capable model exposed by the configured gateway |
 | `BATCH_SIZE` | Pages sent in one Vision request |
 | `PARALLEL_BATCHES` | Maximum concurrent Vision batches |
@@ -150,7 +146,7 @@ secret manager.
 ### Limits and retention
 
 | Variable | Purpose |
-|---|---|
+| --- | --- |
 | `MAX_UPLOAD_SIZE_MB` | Reject oversized uploads |
 | `MAX_PDF_PAGES` | Reject unexpectedly long documents |
 | `MAX_CONCURRENT_JOBS` | Bound total OCR CPU and memory pressure |
@@ -161,9 +157,9 @@ secret manager.
 ### Authentication and browser security
 
 | Variable | Purpose |
-|---|---|
+| --- | --- |
 | `SMART_PDF_ADMIN_USER` | Explicit web administrator username |
-| `SMART_PDF_ADMIN_PASSWORD` | Explicit password, minimum 12 characters for initial seeding |
+| `SMART_PDF_ADMIN_PASSWORD` | Admin password; 12+ characters for seeding |
 | `OCR_API_KEY` | Credential for programmatic and detailed-health endpoints |
 | `COOKIE_SECURE` | Keep `true` for HTTPS production deployments |
 | `COOKIE_SAMESITE` | Session cookie SameSite policy; defaults to `lax` |
@@ -183,7 +179,7 @@ Two authentication mechanisms are intentionally separate:
 - **`X-API-Key`:** programmatic OCR, batch, LaTeX and detailed health endpoints.
 
 | Method | Path | Authentication | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GET` | `/api/health` | Public | Minimal liveness/readiness response |
 | `GET` | `/api/health/details` | API key | Dependency details |
 | `POST` | `/api/auth/login` | Public | Create a secure web session |
@@ -196,8 +192,8 @@ Two authentication mechanisms are intentionally separate:
 | `GET` | `/api/v1/ocr/{job_id}` | API key | Poll one API job/result |
 | `POST` | `/api/v1/ocr/batch` | API key | Submit up to 10 PDFs |
 | `GET` | `/api/v1/ocr/batch/{batch_id}` | API key | Poll a batch |
-| `GET` | `/api/v1/ocr/batch/{batch_id}/download` | API key | Download a completed ZIP |
-| `POST` | `/api/v1/latex/compile` | API key | Optional restricted LaTeX compilation |
+| `GET` | `/api/v1/ocr/batch/{batch_id}/download` | Key | Download ZIP |
+| `POST` | `/api/v1/latex/compile` | Key | Optional LaTeX compile |
 
 Example single-file submission, with the credential read from the caller's
 environment rather than embedded in a command or source file:
@@ -279,13 +275,13 @@ directly to an untrusted network.
 ## Operations and recovery
 
 | Task | Command |
-|---|---|
+| --- | --- |
 | Service state | `systemctl status smart-pdf` |
 | Recent logs | `journalctl -u smart-pdf -n 100 --no-pager` |
 | Health | `curl --fail http://127.0.0.1:8000/api/health` |
 | Run backup now | `systemctl start smart-pdf-backup.service` |
 | Inspect timers | `systemctl list-timers 'smart-pdf-*'` |
-| Rotate admin password | `sudo /opt/smart-pdf/scripts/rotate-admin-password.sh` |
+| Rotate admin password | `sudo scripts/rotate-admin-password.sh` |
 | Security review | `systemd-analyze security smart-pdf.service` |
 
 Backups are written under `/var/backups/smart-pdf/<UTC timestamp>/` with mode
@@ -314,9 +310,9 @@ before reopening external traffic.
 - API documentation disabled by default; public health exposes minimal metadata
 - HSTS, CSP, clickjacking, MIME-sniffing, referrer and permissions-policy headers
 
-No uploaded PDF, generated output, database, `.env`, password, token or API key is
-intended for source control. The repository ignores runtime data and local-only
-test helpers; run a secret scan before publishing changes.
+No uploaded PDF, generated output, database, `.env`, password, token or API key
+is intended for source control. The repository ignores runtime data and
+local-only test helpers; run a secret scan before publishing changes.
 
 ## Validation
 

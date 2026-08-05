@@ -29,15 +29,17 @@ def get_tesseract_semaphore():
     return _semaphores["tesseract"]
 
 CONFIDENCE_THRESHOLD = int(os.getenv("CONFIDENCE_THRESHOLD", "80"))
-NINE_ROUTER_URL = os.getenv("NINE_ROUTER_URL", "").rstrip("/")
-NINE_ROUTER_API_KEY = os.getenv("NINE_ROUTER_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4-mini")
 TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng+vie")
 
 
 def _require_vision_config() -> None:
-    if not NINE_ROUTER_URL or not NINE_ROUTER_API_KEY:
-        raise RuntimeError("Vision OCR is not configured; set its gateway URL and API key at runtime")
+    if not OPENAI_BASE_URL or not OPENAI_API_KEY:
+        raise RuntimeError(
+            "Vision OCR is not configured; set OPENAI_BASE_URL and OPENAI_API_KEY at runtime"
+        )
 
 ALLOWED_HTML_TAGS = {
     "div", "span", "p", "pre", "br", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -99,7 +101,7 @@ def tesseract_ocr(image: Image.Image, lang: str = None) -> dict:
 
 
 async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
-    """Run Vision AI OCR via 9router.
+    """Run OCR through an OpenAI-compatible Vision endpoint.
     
     HTML-first approach: one API call for HTML, derive plain text from it.
     """
@@ -143,10 +145,10 @@ async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{NINE_ROUTER_URL}/chat/completions",
+            f"{OPENAI_BASE_URL}/chat/completions",
             json=payload,
             headers={
-                "Authorization": f"Bearer {NINE_ROUTER_API_KEY}",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json",
             },
         )
@@ -270,10 +272,10 @@ async def _vision_ocr_batch_unlimited(images: list[tuple[int, Image.Image]]) -> 
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
-                f"{NINE_ROUTER_URL}/chat/completions",
+                f"{OPENAI_BASE_URL}/chat/completions",
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {NINE_ROUTER_API_KEY}",
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "Content-Type": "application/json",
                 },
             )

@@ -15,6 +15,8 @@ if str(BACKEND_DIR) not in sys.path:
 os.environ["SMART_PDF_ADMIN_USER"] = "test-admin"
 os.environ["SMART_PDF_ADMIN_PASSWORD"] = "test-password-long"  # pragma: allowlist secret
 os.environ["OCR_API_KEY"] = "test-api-key-long"  # pragma: allowlist secret
+os.environ["OPENAI_BASE_URL"] = "https://openai.example.test/v1"
+os.environ["OPENAI_API_KEY"] = "test-openai-key-long"  # pragma: allowlist secret
 os.environ["CORS_ORIGINS"] = "https://smartpdf.example.test"
 os.environ["COOKIE_SECURE"] = "true"
 os.environ["ENABLE_API_DOCS"] = "false"
@@ -83,9 +85,11 @@ def test_login_uses_secure_cookie_and_unlocks_jobs(client):
 
 def test_programmatic_routes_require_api_key(client):
     assert client.get("/api/health/details").status_code == 401
-    assert client.get(
+    response = client.get(
         "/api/health/details", headers={"X-API-Key": "test-api-key-long"}
-    ).status_code == 200
+    )
+    assert response.status_code == 200
+    assert response.json()["checks"]["vision"]["ok"] is True
 
 
 def test_latex_is_disabled_by_default(client):
