@@ -1,0 +1,40 @@
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+
+# ── Environment / Secrets ─────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Uploads / Runtime data ────────────────────────────────
+backend/uploads/
+backend/data/
+
+# ── Node ──────────────────────────────────────────────────
+node_modules/
+dist/
+.cache/
+
+# ── macOS ─────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editor ────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── SQLite ────────────────────────────────────────────────
+*.sqlite3
+*.db

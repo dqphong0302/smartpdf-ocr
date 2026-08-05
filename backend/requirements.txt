@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pymupdf
+pytesseract
+Pillow
+httpx
+websockets
+python-docx
+pdf-inspector
+mistune
+
