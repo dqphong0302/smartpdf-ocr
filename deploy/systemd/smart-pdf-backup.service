@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up SmartPDF OCR database and configuration
+
+[Service]
+Type=oneshot
+ExecStart=/opt/smart-pdf/scripts/backup-runtime.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/backups /opt/smart-pdf/backend/data

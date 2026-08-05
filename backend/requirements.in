@@ -1,0 +1,14 @@
+argon2-cffi
+bleach
+fastapi
+httpx
+mistune
+pdf-inspector
+pillow
+pymupdf
+pytesseract
+python-docx
+python-dotenv
+python-multipart
+uvicorn[standard]
+websockets

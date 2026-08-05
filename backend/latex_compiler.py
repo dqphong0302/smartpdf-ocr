@@ -3,10 +3,10 @@
 import asyncio
 import os
 import shutil
+import signal
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-
 
 ALLOWED_INPUT_EXTENSIONS = {".tex", ".zip"}
 ALLOWED_ENGINES = {"latexmk", "pdflatex", "xelatex", "lualatex"}
@@ -14,6 +14,7 @@ DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
 MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
 MAX_ZIP_MEMBERS = 500
+MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 LOG_TAIL_CHARS = 8000
 
 
@@ -137,13 +138,17 @@ async def compile_latex_project(
 
     combined_output = []
     exit_code = None
+    proc = None
     try:
         for command in commands:
+            command = _apply_resource_limits(command, timeout_seconds)
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(main_tex.parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=_latex_environment(main_tex.parent),
+                start_new_session=True,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
             text = stdout.decode("utf-8", errors="replace")
@@ -156,7 +161,10 @@ async def compile_latex_project(
                     exit_code=proc.returncode,
                     log_tail=_collect_log_tail(main_tex, combined_output),
                 )
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
+        if proc and proc.returncode is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            await proc.wait()
         raise LatexCompileError(
             f"LaTeX compilation timed out after {timeout_seconds}s",
             engine=selected_engine,
@@ -179,6 +187,35 @@ async def compile_latex_project(
         engine=selected_engine,
         log_tail=_collect_log_tail(main_tex, combined_output),
     )
+
+
+def _latex_environment(job_dir: Path) -> dict[str, str]:
+    """Use a minimal environment and paranoid TeX file access policy."""
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(job_dir),
+        "TMPDIR": str(job_dir),
+        "TEXMFOUTPUT": str(job_dir),
+        "openin_any": "p",
+        "openout_any": "p",
+        "LANG": "C.UTF-8",
+    }
+
+
+def _apply_resource_limits(command: list[str], timeout_seconds: int) -> list[str]:
+    """Bound CPU, address space, file size, and process count when Linux prlimit exists."""
+    prlimit = shutil.which("prlimit")
+    if not prlimit:
+        return command
+    return [
+        prlimit,
+        f"--cpu={timeout_seconds}",
+        "--as=1073741824",
+        f"--fsize={MAX_OUTPUT_BYTES}",
+        "--nproc=64",
+        "--",
+        *command,
+    ]
 
 
 def _select_engine(engine: str) -> str:

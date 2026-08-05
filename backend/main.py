@@ -2,36 +2,86 @@
 import asyncio
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
+import time
 import uuid
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+from auth import authenticate, init_auth_tables, logout, seed_default_user, validate_session
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
-from auth import authenticate, init_auth_tables, logout, seed_default_user, validate_session
 from job_manager import Job, JobStatus, PageResult, PageStatus, job_manager
 from latex_compiler import LatexCompileError, compile_latex_project, get_latex_health, prepare_latex_workspace
-from ocr_engine import smart_ocr, vision_ocr_batch
-from pdf_analyzer import analyze_pdf, extract_page_text, extract_page_markdown, get_page_thumbnail, render_page_to_image, extract_page_images
+from ocr_engine import sanitize_ocr_html, smart_ocr, vision_ocr_batch
+from pdf_analyzer import (
+    analyze_pdf,
+    extract_page_images,
+    extract_page_markdown,
+    extract_page_text,
+    get_page_thumbnail,
+    render_page_to_image,
+)
+from pydantic import BaseModel
 
 load_dotenv()
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 MAX_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "500"))
 JOB_MAX_AGE_DAYS = int(os.getenv("JOB_MAX_AGE_DAYS", "7"))
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").lower() in {"1", "true", "yes", "on"}
+LATEX_COMPILE_ENABLED = os.getenv("LATEX_COMPILE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
 logger = logging.getLogger("smart-pdf")
 
-app = FastAPI(title="Smart PDF", version="1.0.0")
 
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in {"1", "true", "yes", "on"}
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_auth_tables()
+    if not seed_default_user():
+        logger.warning("Admin user was not seeded because explicit credentials are missing")
+    cleanup_task = asyncio.create_task(_cleanup_scheduler())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(
+    title="Smart PDF",
+    version="1.1.0",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+    lifespan=lifespan,
+)
+
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() in {"1", "true", "yes", "on"}
 COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "lax")
 CORS_ORIGINS = [
     origin.strip()
@@ -47,16 +97,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+_login_attempts: dict[str, deque[float]] = defaultdict(deque)
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_ATTEMPTS = 5
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; connect-src 'self' wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    )
+    if COOKIE_SECURE:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
+
+async def read_upload_limited(file: UploadFile) -> bytes:
+    """Read an upload in bounded chunks and reject oversized bodies early."""
+    chunks = []
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_SIZE:
+            raise HTTPException(413, f"File too large. Max {MAX_SIZE // (1024 * 1024)}MB")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def safe_upload_name(filename: str | None, allowed_suffixes: set[str]) -> str:
+    """Return a normalized basename and enforce the declared file type."""
+    safe_name = Path(filename or "").name.strip()
+    if not safe_name or Path(safe_name).suffix.lower() not in allowed_suffixes:
+        expected = ", ".join(sorted(allowed_suffixes))
+        raise HTTPException(400, f"Only {expected} files are accepted")
+    return safe_name
+
 
 # ── Auth ────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup():
-    init_auth_tables()
-    seed_default_user()
-    # Start background cleanup scheduler
-    asyncio.create_task(_cleanup_scheduler())
-
 
 async def _cleanup_scheduler():
     """Run cleanup every 24 hours to delete expired jobs."""
@@ -92,10 +177,20 @@ class LoginBody(BaseModel):
 
 
 @app.post("/api/auth/login")
-async def login(body: LoginBody):
+async def login(body: LoginBody, request: Request):
+    client_key = request.client.host if request.client else "unknown"
+    now = time.time()
+    attempts = _login_attempts[client_key]
+    while attempts and attempts[0] < now - LOGIN_WINDOW_SECONDS:
+        attempts.popleft()
+    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+        raise HTTPException(429, "Too many login attempts. Try again later.")
+
     token = authenticate(body.username, body.password)
     if not token:
+        attempts.append(now)
         raise HTTPException(401, "Sai tên đăng nhập hoặc mật khẩu")
+    attempts.clear()
     resp = JSONResponse({"status": "ok", "username": body.username})
     resp.set_cookie(
         "session", token,
@@ -103,6 +198,7 @@ async def login(body: LoginBody):
         max_age=30 * 24 * 3600,
         samesite=COOKIE_SAMESITE,
         secure=COOKIE_SECURE,
+        path="/",
     )
     return resp
 
@@ -113,7 +209,7 @@ async def logout_endpoint(request: Request):
     if token:
         logout(token)
     resp = JSONResponse({"status": "ok"})
-    resp.delete_cookie("session")
+    resp.delete_cookie("session", path="/", secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE)
     return resp
 
 
@@ -129,29 +225,27 @@ async def check_auth(request: Request):
 # ── Upload PDF ──────────────────────────────────────────────────────
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...), _user: str = Depends(require_auth)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are accepted")
-
-    content = await file.read()
-    if len(content) > MAX_SIZE:
-        raise HTTPException(400, f"File too large. Max {MAX_SIZE // (1024*1024)}MB")
+    filename = safe_upload_name(file.filename, {".pdf"})
+    content = await read_upload_limited(file)
 
     # Save file
-    filepath = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{file.filename}"
+    filepath = UPLOAD_DIR / f"{uuid.uuid4().hex[:12]}_{filename}"
     with open(filepath, "wb") as f:
         f.write(content)
 
     # Create job
-    job = job_manager.create_job(filename=file.filename, filepath=str(filepath))
+    job = job_manager.create_job(filename=filename, filepath=str(filepath))
 
     # Analyze PDF
     await job_manager.update_job_status(job.job_id, JobStatus.ANALYZING)
     try:
         analysis = analyze_pdf(str(filepath))
+        if analysis.total_pages > MAX_PDF_PAGES:
+            raise ValueError(f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}")
     except Exception as e:
         await job_manager.update_job_status(job.job_id, JobStatus.FAILED)
         job.error = str(e)
-        raise HTTPException(500, f"PDF analysis failed: {e}")
+        raise HTTPException(500, f"PDF analysis failed: {e}") from e
 
     job.total_pages = analysis.total_pages
     # Initialize page results
@@ -169,7 +263,7 @@ async def upload_file(file: UploadFile = File(...), _user: str = Depends(require
 
     return {
         "job_id": job.job_id,
-        "filename": file.filename,
+        "filename": filename,
         "analysis": analysis.to_dict(),
     }
 
@@ -182,7 +276,7 @@ async def list_jobs(_user: str = Depends(require_auth)):
 
 # ── Get Job Status ─────────────────────────────────────────────────
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str, include_text: bool = False):
+async def get_job(job_id: str, include_text: bool = False, _user: str = Depends(require_auth)):
     data = job_manager.get_job_dict(job_id, include_text=include_text)
     if not data:
         raise HTTPException(404, "Job not found")
@@ -238,7 +332,7 @@ async def start_ocr(
     job_manager.persist_job(job.job_id)
 
     # Process in background
-    asyncio.create_task(_process_pages(job, selected, force_method, extract_images))
+    asyncio.create_task(_process_pages_limited(job, selected, force_method, extract_images))
 
     return {"job_id": job_id, "selected_pages": selected, "total": len(selected)}
 
@@ -250,9 +344,9 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4"))  # pages per vision API call
 def inline_base64_images(html_content: str, job_id: str) -> str:
     """Find all references to /api/extracted-images/{job_id}/{filename} in html_content,
     read them from disk, base64-encode them, and inline them into the src attribute."""
-    import re
     import base64
     import os
+    import re
 
     # Pattern matches src="/api/extracted-images/{job_id}/{filename}"
     pattern = r'src=["\']/api/extracted-images/([a-zA-Z0-9_\-]+)/([^"\']+)["\']'
@@ -287,6 +381,7 @@ def inline_base64_images(html_content: str, job_id: str) -> str:
 
 def _enrich_html_with_images(job_id: str, page_num: int, filepath: str, html_text: str, extract_images: bool) -> str:
     """Helper to extract page images using PyMuPDF and append a styled gallery to the page HTML."""
+    html_text = sanitize_ocr_html(html_text)
     if not extract_images:
         return html_text
     
@@ -451,7 +546,7 @@ async def _process_pages(job: Job, pages: list[int], force_method: str = None, e
             """Process a single vision batch and update page results."""
             try:
                 results = await vision_ocr_batch(batch)
-                for (pn, _img), result in zip(batch, results):
+                for (pn, _img), result in zip(batch, results, strict=True):
                     raw_html = result.get("html_text", f"<pre>{result['text']}</pre>")
                     enriched_html = _enrich_html_with_images(job.job_id, pn, job.filepath, raw_html, extract_images)
                     
@@ -482,10 +577,16 @@ async def _process_pages(job: Job, pages: list[int], force_method: str = None, e
     await job_manager.update_job_status(job.job_id, JobStatus.COMPLETED)
 
 
+async def _process_pages_limited(job: Job, pages: list[int], force_method: str = None, extract_images: bool = False):
+    async with _job_semaphore:
+        await _process_pages(job, pages, force_method, extract_images)
+
+
 
 # ── Page Thumbnail ──────────────────────────────────────────────────
 @app.get("/api/thumbnail/{job_id}/{page_num}")
-async def get_thumbnail(job_id: str, page_num: int, width: int = 200):
+async def get_thumbnail(job_id: str, page_num: int, width: int = 200, _user: str = Depends(require_auth)):
+    width = max(64, min(width, 1600))
     job = job_manager.get_job(job_id)
     filepath = job.filepath if job else None
     if not filepath:
@@ -508,7 +609,7 @@ async def get_thumbnail(job_id: str, page_num: int, width: int = 200):
 
 # ── Extracted Images Safe Serving ───────────────────────────────────
 @app.get("/api/extracted-images/{job_id}/{filename}")
-async def get_extracted_image(job_id: str, filename: str):
+async def get_extracted_image(job_id: str, filename: str, _user: str = Depends(require_auth)):
     """Serve an extracted image safely from the uploads directory."""
     import os
     # Sandbox check: prevent directory traversal
@@ -521,7 +622,7 @@ async def get_extracted_image(job_id: str, filename: str):
 
 # ── Download Results ────────────────────────────────────────────────
 @app.get("/api/download/{job_id}")
-async def download_results(job_id: str, format: str = "txt"):
+async def download_results(job_id: str, format: str = "txt", _user: str = Depends(require_auth)):
     import urllib.parse
     export_format = (format or "txt").lower()
     if export_format == "text":
@@ -582,7 +683,7 @@ async def download_results(job_id: str, format: str = "txt"):
             text = p.get("text", "")
             html_text = p.get("html_text", "")
             if text or html_text:
-                html_parts.append(f'<div class="page">')
+                html_parts.append('<div class="page">')
                 html_parts.append(f'<div class="page-header">Trang {num} · {p.get("method", "")} · {p.get("confidence", 0)}%</div>')
                 html_parts.append(html_text if html_text else f'<pre>{text}</pre>')
                 html_parts.append('</div>')
@@ -638,8 +739,9 @@ async def download_results(job_id: str, format: str = "txt"):
                 img_dir = UPLOAD_DIR / "extracted_images" / job_id
                 if img_dir.exists() and img_dir.is_dir():
                     try:
-                        from docx.shared import Inches
                         import glob
+
+                        from docx.shared import Inches
                         pattern = str(img_dir / f"page_{num}_img_*")
                         img_files = glob.glob(pattern)
                         
@@ -735,6 +837,11 @@ def _html_to_markdown(html: str) -> str:
 # ── WebSocket for real-time progress ───────────────────────────────
 @app.websocket("/ws/{job_id}")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
+    token = websocket.cookies.get("session")
+    origin = websocket.headers.get("origin", "")
+    if not validate_session(token) or (origin and origin not in CORS_ORIGINS):
+        await websocket.close(code=4401)
+        return
     job = job_manager.get_job(job_id)
     if not job:
         await websocket.close(code=4004)
@@ -752,7 +859,7 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
     try:
         while True:
             # Keep connection alive, wait for client messages
-            data = await websocket.receive_text()
+            await websocket.receive_text()
     except WebSocketDisconnect:
         await job_manager.remove_websocket(job_id, websocket)
 
@@ -775,7 +882,7 @@ async def _delayed_cleanup_batch_job(batch_id: str):
 def require_api_key(request: Request):
     """Dependency: require valid API key via X-API-Key header."""
     key = request.headers.get("X-API-Key", "")
-    if not OCR_API_KEY or key != OCR_API_KEY:
+    if not OCR_API_KEY or not secrets.compare_digest(key, OCR_API_KEY):
         raise HTTPException(401, "Invalid or missing API key")
     return True
 
@@ -790,24 +897,22 @@ async def simple_ocr_submit(
     _auth: bool = Depends(require_api_key),
 ):
     """Submit PDF for OCR. Returns job_id for polling."""
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are accepted")
-
-    content = await file.read()
-    if len(content) > MAX_SIZE:
-        raise HTTPException(400, f"File too large. Max {MAX_SIZE // (1024*1024)}MB")
+    filename = safe_upload_name(file.filename, {".pdf"})
+    content = await read_upload_limited(file)
 
     # Save file
-    filepath = UPLOAD_DIR / f"api_{uuid.uuid4().hex[:8]}_{file.filename}"
+    filepath = UPLOAD_DIR / f"api_{uuid.uuid4().hex[:12]}_{filename}"
     with open(filepath, "wb") as f:
         f.write(content)
 
     # Analyze PDF
     try:
         analysis = analyze_pdf(str(filepath))
+        if analysis.total_pages > MAX_PDF_PAGES:
+            raise ValueError(f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}")
     except Exception as e:
         os.remove(filepath)
-        raise HTTPException(500, f"PDF analysis failed: {e}")
+        raise HTTPException(500, f"PDF analysis failed: {e}") from e
 
     # Determine pages
     all_pages = list(range(1, analysis.total_pages + 1))
@@ -830,7 +935,7 @@ async def simple_ocr_submit(
     job_id = uuid.uuid4().hex[:12]
     _api_jobs[job_id] = {
         "status": "processing",
-        "filename": file.filename,
+        "filename": filename,
         "filepath": str(filepath),
         "total_pages": len(selected),
         "completed_pages": 0,
@@ -840,18 +945,19 @@ async def simple_ocr_submit(
     }
 
     # Process in background
-    asyncio.create_task(_run_api_ocr_and_cleanup(job_id, str(filepath), file.filename, selected, method, analysis, extract_images))
+    asyncio.create_task(_run_api_ocr_and_cleanup(job_id, str(filepath), filename, selected, method, analysis, extract_images))
 
     return {
         "job_id": job_id,
         "status": "processing",
-        "filename": file.filename,
+        "filename": filename,
         "total_pages": len(selected),
         "poll_url": f"/api/v1/ocr/{job_id}",
     }
 
 async def _run_api_ocr_and_cleanup(job_id, filepath, filename, selected, method, analysis, extract_images):
-    await _api_ocr_process(job_id, filepath, filename, selected, method, analysis, extract_images)
+    async with _job_semaphore:
+        await _api_ocr_process(job_id, filepath, filename, selected, method, analysis, extract_images)
     asyncio.create_task(_delayed_cleanup_api_job(job_id))
 
 async def _api_ocr_process(job_id: str, filepath: str, filename: str, selected: list[int], method: str, analysis, extract_images: bool = False):
@@ -860,7 +966,6 @@ async def _api_ocr_process(job_id: str, filepath: str, filename: str, selected: 
     Phase 1: Handle digital/tesseract pages sequentially (fast, no API calls).
     Phase 2: Collect vision-destined pages, batch and run in parallel.
     """
-    import time as _time
     job = _api_jobs[job_id]
     force = method if method != "auto" else None
 
@@ -959,7 +1064,7 @@ async def _api_ocr_process(job_id: str, filepath: str, filename: str, selected: 
 
             async def _run_batch(batch):
                 results = await vision_ocr_batch(batch)
-                for (pn, _img), result in zip(batch, results):
+                for (pn, _img), result in zip(batch, results, strict=True):
                     raw_html = result.get("html_text", f"<pre>{result['text']}</pre>")
                     enriched_html = _enrich_html_with_images(job_id, pn, filepath, raw_html, extract_images)
                     
@@ -1074,16 +1179,18 @@ async def batch_ocr_submit(
     _auth: bool = Depends(require_api_key),
 ):
     """Submit multiple PDFs for OCR. Returns batch_id for polling."""
+    if not files or len(files) > 10:
+        raise HTTPException(400, "Batch must contain between 1 and 10 PDF files")
     batch_id = uuid.uuid4().hex[:12]
     
     saved_files = []
     for f in files:
-        if f.filename.lower().endswith(".pdf"):
-            content = await f.read()
-            filepath = UPLOAD_DIR / f"batch_{batch_id}_{uuid.uuid4().hex[:8]}_{f.filename}"
-            with open(filepath, "wb") as out:
-                out.write(content)
-            saved_files.append((str(filepath), f.filename))
+        filename = safe_upload_name(f.filename, {".pdf"})
+        content = await read_upload_limited(f)
+        filepath = UPLOAD_DIR / f"batch_{batch_id}_{uuid.uuid4().hex[:12]}_{filename}"
+        with open(filepath, "wb") as out:
+            out.write(content)
+        saved_files.append((str(filepath), filename))
             
     if not saved_files:
         raise HTTPException(400, "No valid PDF files uploaded")
@@ -1114,6 +1221,8 @@ async def _process_batch_task(batch_id: str, saved_files: list, method: str):
     for filepath, filename in saved_files:
         try:
             analysis = analyze_pdf(filepath)
+            if analysis.total_pages > MAX_PDF_PAGES:
+                raise ValueError(f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}")
             selected = list(range(1, analysis.total_pages + 1))
             
             job_id = uuid.uuid4().hex[:12]
@@ -1128,7 +1237,8 @@ async def _process_batch_task(batch_id: str, saved_files: list, method: str):
                 "error": None,
             }
             # Process sequentially to bound memory usage
-            await _api_ocr_process(job_id, filepath, filename, selected, method, analysis)
+            async with _job_semaphore:
+                await _api_ocr_process(job_id, filepath, filename, selected, method, analysis)
             asyncio.create_task(_delayed_cleanup_api_job(job_id))
             
             job = _api_jobs[job_id]
@@ -1219,10 +1329,10 @@ async def latex_compile_endpoint(
     _auth: bool = Depends(require_api_key),
 ):
     """Compile a LaTeX .tex file or .zip project and return the generated PDF."""
-    filename = file.filename or "main.tex"
-    content = await file.read()
-    if len(content) > MAX_SIZE:
-        raise HTTPException(400, f"File too large. Max {MAX_SIZE // (1024*1024)}MB")
+    if not LATEX_COMPILE_ENABLED:
+        raise HTTPException(503, "LaTeX compilation is disabled")
+    filename = safe_upload_name(file.filename or "main.tex", {".tex", ".zip"})
+    content = await read_upload_limited(file)
 
     job_dir = UPLOAD_DIR / f"latex_{uuid.uuid4().hex[:12]}"
     try:
@@ -1253,9 +1363,8 @@ async def latex_compile_endpoint(
 
 
 # ── Health Check ────────────────────────────────────────────────────
-@app.get("/api/health")
-async def health():
-    """Return service and dependency health for runtime diagnostics."""
+def collect_health() -> tuple[str, dict]:
+    """Collect dependency health without exposing configuration publicly."""
     db_ok = False
     db_error = None
     try:
@@ -1278,29 +1387,39 @@ async def health():
         upload_error = str(exc)
 
     tesseract_path = shutil.which("tesseract")
-    nine_router_url = os.getenv("NINE_ROUTER_URL", "")
-    nine_router_host = nine_router_url.split("//")[-1].split("/")[0] if nine_router_url else ""
-
     latex_health = get_latex_health()
 
     checks = {
         "database": {"ok": db_ok, "error": db_error},
-        "uploads": {"ok": upload_writable, "path": str(UPLOAD_DIR), "error": upload_error},
-        "tesseract": {"ok": bool(tesseract_path), "path": tesseract_path},
+        "uploads": {"ok": upload_writable, "error": upload_error},
+        "tesseract": {"ok": bool(tesseract_path)},
         "vision": {
             "ok": bool(os.getenv("NINE_ROUTER_API_KEY")),
             "model": os.getenv("VISION_MODEL", ""),
-            "9router_host": nine_router_host,
         },
-        "latex": latex_health,
+        "latex": {
+            "ok": not LATEX_COMPILE_ENABLED or latex_health["ok"],
+            "enabled": LATEX_COMPILE_ENABLED,
+        },
     }
     status = "ok" if all(item["ok"] for item in checks.values()) else "degraded"
+    return status, checks
+
+
+@app.get("/api/health")
+async def health():
+    status, _checks = collect_health()
     return {
         "status": status,
         "service": "smart-pdf",
         "version": app.version,
-        "checks": checks,
     }
+
+
+@app.get("/api/health/details")
+async def health_details(_auth: bool = Depends(require_api_key)):
+    status, checks = collect_health()
+    return {"status": status, "service": "smart-pdf", "version": app.version, "checks": checks}
 
 
 # ── Static files (production) ──────────────────────────────────────
@@ -1311,8 +1430,10 @@ if DIST_DIR.exists():
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         """Serve index.html for all non-API routes (SPA fallback)."""
-        file_path = DIST_DIR / full_path
-        if full_path and file_path.exists() and file_path.is_file():
+        if full_path == "docs" or full_path == "redoc" or full_path == "openapi.json" or full_path.startswith("api/"):
+            raise HTTPException(404, "Not found")
+        file_path = (DIST_DIR / full_path).resolve()
+        if full_path and file_path.is_relative_to(DIST_DIR.resolve()) and file_path.exists() and file_path.is_file():
             return FileResponse(file_path)
         return FileResponse(DIST_DIR / "index.html")
 

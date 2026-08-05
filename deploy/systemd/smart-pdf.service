@@ -1,0 +1,50 @@
+[Unit]
+Description=SmartPDF OCR API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=smartpdf
+Group=smartpdf
+WorkingDirectory=/opt/smart-pdf/backend
+EnvironmentFile=/opt/smart-pdf/backend/.env
+Environment=PATH=/opt/smart-pdf/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/smart-pdf/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/smart-pdf/backend/data /opt/smart-pdf/backend/uploads
+
+MemoryMax=3G
+TasksMax=256
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

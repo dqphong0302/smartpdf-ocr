@@ -1,29 +1,38 @@
 """Authentication — Cookie-based sessions with SQLite storage."""
 import hashlib
+import hmac
 import os
 import secrets
-import sqlite3
 import time
-from pathlib import Path
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from database import _get_conn
 
 # Session lifetime: 30 days
 SESSION_TTL = 30 * 24 * 3600
+_password_hasher = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 
 
-def _hash_password(password: str, salt: str = "") -> str:
-    """SHA-256 hash with salt."""
-    if not salt:
-        salt = secrets.token_hex(16)
-    hashed = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    return f"{salt}:{hashed}"
+def _hash_password(password: str) -> str:
+    """Hash a password with Argon2id."""
+    return _password_hasher.hash(password)
 
 
 def _verify_password(password: str, stored: str) -> bool:
-    """Verify password against stored hash."""
-    salt = stored.split(":")[0]
-    return _hash_password(password, salt) == stored
+    """Verify Argon2id hashes and support one-time migration from legacy SHA-256."""
+    if stored.startswith("$argon2"):
+        try:
+            return _password_hasher.verify(stored, password)
+        except (InvalidHashError, VerifyMismatchError):
+            return False
+
+    try:
+        salt, expected = stored.split(":", 1)
+    except ValueError:
+        return False
+    actual = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    return hmac.compare_digest(actual, expected)
 
 
 def init_auth_tables():
@@ -49,9 +58,13 @@ def init_auth_tables():
 
 
 def seed_default_user(username: str | None = None, password: str | None = None):
-    """Create default user if not exists, using env-driven credentials."""
-    username = username or os.getenv("SMART_PDF_ADMIN_USER", "admin")
-    password = password or os.getenv("SMART_PDF_ADMIN_PASSWORD", "changeme")
+    """Create the initial user only when explicit credentials are configured."""
+    username = username or os.getenv("SMART_PDF_ADMIN_USER", "").strip()
+    password = password or os.getenv("SMART_PDF_ADMIN_PASSWORD", "")
+    if not username or not password:
+        return False
+    if len(password) < 12:
+        raise RuntimeError("SMART_PDF_ADMIN_PASSWORD must contain at least 12 characters")
     conn = _get_conn()
     row = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
     if not row:
@@ -61,6 +74,7 @@ def seed_default_user(username: str | None = None, password: str | None = None):
         )
         conn.commit()
     conn.close()
+    return True
 
 
 def authenticate(username: str, password: str) -> str | None:
@@ -70,6 +84,12 @@ def authenticate(username: str, password: str) -> str | None:
     if not row or not _verify_password(password, row["password_hash"]):
         conn.close()
         return None
+
+    if not row["password_hash"].startswith("$argon2"):
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE username = ?",
+            (_hash_password(password), username),
+        )
 
     # Create session
     token = secrets.token_urlsafe(32)
