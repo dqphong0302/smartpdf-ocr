@@ -39,7 +39,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from book_translator import get_llm_config, translate_pdf_book
+from book_translator import get_llm_config, translate_pdf_book, glossary_manager
 from job_manager import Job, JobStatus, PageResult, PageStatus, job_manager
 from latex_compiler import LatexCompileError, compile_latex_project, get_latex_health, prepare_latex_workspace
 from ocr_engine import sanitize_ocr_html, smart_ocr, vision_ocr_batch
@@ -1070,11 +1070,19 @@ async def _process_translation_task(
         )
 
 
+class TranslationPayload(BaseModel):
+    mode: str = "inplace"
+    glossary_profile: str = "general"
+    model: str | None = None
+    pages: list[int] | None = None
+
+
 @app.post("/api/translate/{job_id}")
 async def start_book_translation(
     job_id: str,
+    payload: TranslationPayload | None = None,
     mode: str = Query(default="inplace", description="inplace | bilingual_dual"),
-    glossary_profile: str = Query(default="general", description="general | medical | dental"),
+    glossary_profile: str = Query(default="general", description="general | medical | dental | tech"),
     model: str = Query(default=None, description="GPT model from 9router (e.g. gpt-5.6-luna)"),
     pages: list[int] = Query(default=None, description="Page numbers to translate (1-indexed)"),
     _user: str = Depends(require_auth),
@@ -1088,21 +1096,27 @@ async def start_book_translation(
     if job.status == JobStatus.PROCESSING:
         raise HTTPException(409, "Job is already processing")
 
-    selected = pages if pages else list(range(1, job.total_pages + 1))
+    # Resolve arguments from payload if provided, otherwise fallback to query params
+    effective_mode = (payload.mode if payload else None) or mode or "inplace"
+    effective_profile = (payload.glossary_profile if payload else None) or glossary_profile or "general"
+    effective_model = (payload.model if payload else None) or model
+    effective_pages = (payload.pages if payload and payload.pages else None) or pages
+
+    selected = effective_pages if effective_pages else list(range(1, job.total_pages + 1))
     job.selected_pages = selected
     job.status = JobStatus.PROCESSING
     job.started_at = time.time()
     job_manager.persist_job(job.job_id)
 
     _track_ocr_task(
-        _process_translation_task(job, mode, glossary_profile, model, selected),
+        _process_translation_task(job, effective_mode, effective_profile, effective_model, selected),
         f"ui-translate-{job_id}",
     )
     return {
         "job_id": job_id,
-        "mode": mode,
-        "glossary_profile": glossary_profile,
-        "model": model or os.getenv("SMART_PDF_GPT_MODEL", "gpt-5.6-luna"),
+        "mode": effective_mode,
+        "glossary_profile": effective_profile,
+        "model": effective_model or os.getenv("SMART_PDF_GPT_MODEL", "gpt-5.6-luna"),
         "selected_pages": selected,
         "total_selected": len(selected),
     }
@@ -1111,9 +1125,10 @@ async def start_book_translation(
 @app.get("/api/translate/{job_id}/download")
 async def download_translated_pdf_file(
     job_id: str,
+    inline: bool = Query(default=False),
     _user: str = Depends(require_auth),
 ):
-    """Download translated PDF with layout and images preserved."""
+    """Download translated PDF with layout and images preserved, or view inline in browser."""
     import urllib.parse
     job = job_manager.get_job(job_id)
     if not job:
@@ -1124,11 +1139,45 @@ async def download_translated_pdf_file(
         raise HTTPException(404, "Translated PDF not found or still processing")
 
     filename_encoded = urllib.parse.quote(f"translated_{job.filename}")
+    disposition = "inline" if inline else f"attachment; filename*=utf-8''{filename_encoded}"
     return FileResponse(
         path=str(output_pdf),
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename*=utf-8''{filename_encoded}"},
+        headers={"Content-Disposition": disposition},
     )
+
+
+@app.get("/api/translate/glossaries")
+async def get_available_glossaries():
+    """List available domain glossaries and custom terminology files."""
+    profiles = [
+        {"id": "general", "name": "Học thuật Tổng quát", "desc": "Giữ nguyên cấu trúc câu học thuật và số liệu", "icon": "🌐"},
+        {"id": "medical", "name": "Y khoa Lâm sàng", "desc": "Bộ chuẩn MeSH / UMLS / ICD-10 và Giải phẫu học", "icon": "🩺"},
+        {"id": "dental", "name": "Nha khoa & Khớp TMD", "desc": "Khớp thái dương hàm, Cắn khớp, Implant, Nha chu", "icon": "🦷"},
+        {"id": "tech", "name": "Kỹ thuật & Công nghệ", "desc": "Hệ thống phân tán, AI/ML, Cloud, Vi mạch", "icon": "💻"},
+    ]
+    cached_profiles = set(glossary_manager._cache.keys())
+    existing_ids = {p["id"] for p in profiles}
+    for cp in cached_profiles:
+        if cp not in existing_ids and not cp.startswith("book_"):
+            profiles.append({
+                "id": cp,
+                "name": cp.capitalize(),
+                "desc": f"Từ điển tùy biến ({len(glossary_manager._cache[cp])} thuật ngữ)",
+                "icon": "📚",
+            })
+    return {"glossaries": profiles}
+
+
+@app.get("/api/translate/{job_id}/glossary")
+async def get_job_glossary(job_id: str, _user: str = Depends(require_auth)):
+    """Retrieve auto-mined or matched terminology for this document."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    book_key = f"book_{Path(job.filepath).stem.lower()}"
+    terms = glossary_manager._cache.get(book_key, {})
+    return {"job_id": job_id, "terms": terms, "total_terms": len(terms)}
 
 
 @app.get("/api/v1/models/gpt")
