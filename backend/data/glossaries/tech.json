@@ -1,0 +1,19 @@
+{
+  "microservices": "kiến trúc vi dịch vụ (microservices)",
+  "concurrency": "xử lý đồng thời (concurrency)",
+  "throughput": "thông lượng (throughput)",
+  "latency": "độ trễ (latency)",
+  "database sharding": "phân mảnh cơ sở dữ liệu (database sharding)",
+  "deadlock": "khóa chết (deadlock)",
+  "race condition": "điều kiện tương tranh (race condition)",
+  "load balancer": "bộ cân bằng tải (load balancer)",
+  "reverse proxy": "proxy ngược (reverse proxy)",
+  "cache invalidation": "vô hiệu hóa bộ nhớ đệm (cache invalidation)",
+  "idempotency": "tính lũy thỏa / tính bất biến lặp (idempotency)",
+  "containerization": "đóng gói vùng chứa (containerization)",
+  "orchestration": "điều phối hệ thống (orchestration)",
+  "continuous integration": "tích hợp liên tục (continuous integration - CI)",
+  "continuous deployment": "triển khai liên tục (continuous deployment - CD)",
+  "asynchronous": "bất đồng bộ (asynchronous)",
+  "synchronous": "đồng bộ (synchronous)"
+}

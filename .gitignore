@@ -18,6 +18,8 @@ env/
 # ── Uploads / Runtime data ────────────────────────────────
 backend/uploads/
 backend/data/
+!backend/data/glossaries/
+!backend/data/glossaries/**
 
 # ── Node ──────────────────────────────────────────────────
 node_modules/
