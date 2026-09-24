@@ -1,18 +1,35 @@
 #!/usr/bin/env node
 /** SmartPDF OCR MCP server — strict, bounded stdio adapter. */
 
+import dns from "node:dns";
 import { openAsBlob, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+
+try {
+  dns.setDefaultResultOrder("ipv4first");
+  const _origLookup = dns.lookup;
+  dns.lookup = function (hostname, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = { family: 4 };
+    } else if (typeof options === "object" && options !== null) {
+      options = { ...options, family: 4 };
+    } else if (typeof options === "number") {
+      options = 4;
+    }
+    return _origLookup.call(dns, hostname, options, callback);
+  };
+} catch {}
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
 export const MCP_NAME = "smart-pdf";
-export const MCP_VERSION = "2.1.0";
-export const TOOL_NAMES = ["ocr_health", "ocr_submit", "ocr_status", "ocr_download", "ocr_jobs"];
+export const MCP_VERSION = "2.3.0";
+export const TOOL_NAMES = ["ocr_health", "ocr_submit", "ocr_status", "ocr_download", "ocr_jobs", "pdf_metadata"];
 const BACKEND_BATCH_LIMIT = 10;
 const DEFAULT_MAX_FILE_MB = 50;
 const DEFAULT_MAX_BATCH_FILES = 50;
@@ -262,7 +279,25 @@ export function createRuntime(config, dependencies = {}) {
     return outputPath;
   }
 
-  async function detectIdKind(id) {
+  async function detectIdKind(id, expectedKind) {
+    if (expectedKind === "batch") {
+      return {
+        kind: "batch",
+        data: await apiRequest(`/api/v1/ocr/batch/${encodeURIComponent(id)}`, { useApiKey: true }),
+      };
+    }
+    if (expectedKind === "job") {
+      return {
+        kind: "job_simple",
+        data: await apiRequest(`/api/v1/ocr/${encodeURIComponent(id)}`, { useApiKey: true }),
+      };
+    }
+    if (expectedKind === "ui") {
+      return {
+        kind: "job_full",
+        data: await apiRequest(`/api/jobs/${encodeURIComponent(id)}?include_text=false`, { useSession: true }),
+      };
+    }
     if (config.apiKey) {
       try {
         return { kind: "batch", data: await apiRequest(`/api/v1/ocr/batch/${encodeURIComponent(id)}`, { useApiKey: true }) };
@@ -315,8 +350,8 @@ export function createRuntime(config, dependencies = {}) {
     });
   }
 
-  async function statusOne(id, includeText) {
-    const detected = await detectIdKind(id);
+  async function statusOne(id, includeText, kind) {
+    const detected = await detectIdKind(id, kind);
     if (detected.kind === "batch") return { kind: "batch", id, ...detected.data };
     if (detected.kind === "job_simple" && typeof detected.data === "string") {
       const text = stripHtml(detected.data);
@@ -465,18 +500,24 @@ export function createRuntime(config, dependencies = {}) {
 
     if (name === "ocr_status") {
       if (args.ids) {
-        const items = await Promise.all(args.ids.map((id) => statusOne(id, Boolean(args.include_text))));
+        const items = await Promise.all(
+          args.ids.map((id) => statusOne(id, Boolean(args.include_text), args.kind)),
+        );
         const statuses = items.map((item) => item.status);
         const status = statuses.every((value) => value === "completed")
           ? "completed"
-          : statuses.some((value) => value === "failed") ? "partial_failure" : "processing";
+          : statuses.every((value) => value === "interrupted")
+            ? "interrupted"
+            : statuses.some((value) => ["failed", "interrupted"].includes(value))
+              ? "partial_failure"
+              : "processing";
         return { kind: "group", status, ids: args.ids, items };
       }
-      return statusOne(args.id, Boolean(args.include_text));
+      return statusOne(args.id, Boolean(args.include_text), args.kind);
     }
 
     if (name === "ocr_download") {
-      const detected = await detectIdKind(args.id);
+      const detected = await detectIdKind(args.id, args.kind);
       const overwrite = Boolean(args.overwrite);
       if (detected.kind === "batch") {
         const format = args.format || "zip";
@@ -550,6 +591,19 @@ export function createRuntime(config, dependencies = {}) {
       }
       const jobs = await apiRequest("/api/jobs", { useSession: true });
       return { action: "list", count: Array.isArray(jobs) ? jobs.length : 0, jobs: Array.isArray(jobs) ? jobs : [] };
+    }
+
+    if (name === "pdf_metadata") {
+      const filePath = await validateInputPdf(args.file_path);
+      const fileBlob = await openAsBlob(filePath);
+      const form = new FormData();
+      form.append("file", fileBlob, path.basename(filePath));
+      const res = await apiRequest("/api/v1/pdf/metadata", {
+        method: "POST",
+        body: form,
+        useApiKey: true,
+      });
+      return res;
     }
 
     throw new Error(`Unknown tool: ${name}`);
@@ -695,6 +749,7 @@ export function createSmartPdfServer(config = loadConfig(), dependencies = {}) {
       id: z.string().min(1).optional(),
       ids: z.array(z.string().min(1)).min(1).max(config.maxBatchFiles).optional(),
       include_text: z.boolean().default(false),
+      kind: z.enum(["job", "batch", "ui"]).optional(),
     }).strict().superRefine((value, context) => {
       if (Boolean(value.id) === Boolean(value.ids)) {
         context.addIssue({ code: "custom", message: "Provide exactly one of id or ids" });
@@ -712,6 +767,7 @@ export function createSmartPdfServer(config = loadConfig(), dependencies = {}) {
   if (enabled.has("ocr_download")) {
     const downloadInput = z.object({
       id: z.string().min(1),
+      kind: z.enum(["job", "batch", "ui"]).optional(),
       format: z.enum(["txt", "text", "html", "md", "markdown", "docx", "zip", "json"]).optional(),
       output_path: z.string().min(1).optional(),
       overwrite: z.boolean().default(false),
@@ -744,6 +800,23 @@ export function createSmartPdfServer(config = loadConfig(), dependencies = {}) {
       outputSchema: jobsOutput,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     }, (args) => runtime.handleTool("ocr_jobs", args));
+  }
+
+  if (enabled.has("pdf_metadata")) {
+    const metaInput = z.object({
+      file_path: z.string().min(1).describe("Absolute path to the local PDF file."),
+    }).strict();
+    registerSafeTool(server, "pdf_metadata", {
+      title: "Extract PDF Academic Metadata",
+      description: "Fast zero-token extraction of Title, Authors, DOI, arXiv ID, PMID, and Abstract preview from a local PDF without calling LLMs.",
+      inputSchema: metaInput,
+      outputSchema: z.object({
+        status: z.string(),
+        filename: z.string(),
+        metadata: z.record(z.string(), z.any()),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, (args) => runtime.handleTool("pdf_metadata", args));
   }
 
   return { server, runtime, tools: [...enabled] };

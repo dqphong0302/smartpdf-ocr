@@ -12,6 +12,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from auth import authenticate, init_auth_tables, logout, seed_default_user, validate_session
+from database import (
+    cleanup_expired_api_records,
+    get_client_quota,
+    init_db,
+    load_api_batch,
+    load_api_job,
+    reconcile_interrupted_jobs,
+    save_api_batch,
+    save_api_job,
+)
 from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks,
@@ -29,6 +39,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from book_translator import get_llm_config, translate_pdf_book
 from job_manager import Job, JobStatus, PageResult, PageStatus, job_manager
 from latex_compiler import LatexCompileError, compile_latex_project, get_latex_health, prepare_latex_workspace
 from ocr_engine import sanitize_ocr_html, smart_ocr, vision_ocr_batch
@@ -37,6 +48,7 @@ from pdf_analyzer import (
     extract_page_images,
     extract_page_markdown,
     extract_page_text,
+    extract_pdf_metadata,
     get_page_thumbnail,
     render_page_to_image,
 )
@@ -44,20 +56,64 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "500"))
 JOB_MAX_AGE_DAYS = int(os.getenv("JOB_MAX_AGE_DAYS", "7"))
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
 ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").lower() in {"1", "true", "yes", "on"}
 LATEX_COMPILE_ENABLED = os.getenv("LATEX_COMPILE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+API_JOB_RETENTION_SECONDS = max(300, int(os.getenv("API_JOB_RETENTION_SECONDS", "3600")))
+SHUTDOWN_GRACE_SECONDS = max(1, int(os.getenv("SHUTDOWN_GRACE_SECONDS", "20")))
 
 logger = logging.getLogger("smart-pdf")
+_active_ocr_tasks: set[asyncio.Task] = set()
+_draining = False
+
+
+def _track_ocr_task(coro, label: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=label)
+    _active_ocr_tasks.add(task)
+
+    def _finished(completed: asyncio.Task):
+        _active_ocr_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error:
+            logger.error(
+                "Background task %s failed",
+                label,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_finished)
+    return task
+
+
+async def _drain_ocr_tasks() -> None:
+    pending = {task for task in _active_ocr_tasks if not task.done()}
+    if not pending:
+        return
+    logger.info("Shutdown: waiting up to %ss for %s OCR task(s)", SHUTDOWN_GRACE_SECONDS, len(pending))
+    _, pending = await asyncio.wait(pending, timeout=SHUTDOWN_GRACE_SECONDS)
+    if pending:
+        logger.warning("Shutdown: interrupting %s unfinished OCR task(s)", len(pending))
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _draining
+    _draining = False
+    init_db()
+    recovery = reconcile_interrupted_jobs("Service restarted before OCR completed; submit the document again")
+    if any(recovery.values()):
+        logger.warning("Recovered interrupted jobs after startup: %s", recovery)
+    cleanup_expired_api_records()
     init_auth_tables()
     if not seed_default_user():
         logger.warning("Admin user was not seeded because explicit credentials are missing")
@@ -65,6 +121,8 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        _draining = True
+        await _drain_ocr_tasks()
         cleanup_task.cancel()
         try:
             await cleanup_task
@@ -88,10 +146,13 @@ CORS_ORIGINS = [
     for origin in os.getenv("CORS_ORIGINS", "*").split(",")
     if origin.strip()
 ]
+if "*" in CORS_ORIGINS:
+    logger.warning("CORS_ORIGINS contains '*'; cross-origin credentialed requests are disabled")
+    CORS_ORIGINS = []
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -151,24 +212,86 @@ async def _cleanup_scheduler():
     stats = cleanup_expired_jobs(JOB_MAX_AGE_DAYS)
     if stats["deleted_jobs"] > 0:
         logger.info(f"Startup cleanup: {stats['deleted_jobs']} jobs deleted, {stats['bytes_freed_mb']}MB freed")
-    # Then run daily
+    last_full_cleanup = time.monotonic()
     while True:
-        await asyncio.sleep(86400)  # 24 hours
+        await asyncio.sleep(300)
         try:
-            stats = cleanup_expired_jobs(JOB_MAX_AGE_DAYS)
-            if stats["deleted_jobs"] > 0:
-                logger.info(f"Daily cleanup: {stats['deleted_jobs']} jobs deleted, {stats['bytes_freed_mb']}MB freed")
+            api_stats = cleanup_expired_api_records()
+            for job_id in list(_api_jobs):
+                if not load_api_job(job_id):
+                    _api_jobs.pop(job_id, None)
+            for batch_id in list(_batch_jobs):
+                if not load_api_batch(batch_id):
+                    _batch_jobs.pop(batch_id, None)
+            if any(api_stats.values()):
+                logger.info("Expired API results removed: %s", api_stats)
+            if time.monotonic() - last_full_cleanup >= 86400:
+                stats = cleanup_expired_jobs(JOB_MAX_AGE_DAYS)
+                last_full_cleanup = time.monotonic()
+                if stats["deleted_jobs"] > 0:
+                    logger.info(
+                        "Daily cleanup: %s jobs deleted, %sMB freed",
+                        stats["deleted_jobs"],
+                        stats["bytes_freed_mb"],
+                    )
         except Exception as e:
-            logger.error(f"Cleanup failed: {e}")
+            logger.exception("Cleanup failed: %s", e)
+
+
+def get_client_ip(request: Request) -> str:
+    """Extract proxy headers only when the direct peer is explicitly trusted."""
+    peer = request.client.host if request.client and request.client.host else "127.0.0.1"
+    trusted = {
+        value.strip()
+        for value in os.getenv("TRUSTED_PROXY_IPS", "127.0.0.1,::1").split(",")
+        if value.strip()
+    }
+    if peer not in trusted:
+        return peer
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    x_forwarded = request.headers.get("x-forwarded-for")
+    if x_forwarded:
+        parts = [p.strip() for p in x_forwarded.split(",")]
+        if parts and parts[0]:
+            return parts[0]
+    x_real = request.headers.get("x-real-ip")
+    if x_real:
+        return x_real.strip()
+    return peer
+
+
+def get_client_device_id(request: Request) -> str:
+    """
+    Extract unique machine/device identifier sent from browser hardware fingerprinting.
+    Falls back to IP-based identifier if device header is omitted.
+    """
+    dev_id = request.headers.get("X-Device-Id") or request.headers.get("X-Client-Id") or request.cookies.get("device_id")
+    if dev_id and len(dev_id.strip()) >= 8:
+        clean = "".join(c for c in dev_id.strip() if c.isalnum() or c in "_-")
+        if len(clean) >= 8:
+            return f"dev_{clean[:64]}"
+    return f"ip_{get_client_ip(request)}"
+
+
+def get_current_user_role(request: Request) -> str:
+    """Check if request has admin session or valid master API key."""
+    token = request.cookies.get("session")
+    if token and validate_session(token):
+        return "admin"
+    api_key = request.headers.get("X-API-Key") or ""
+    if OCR_API_KEY and api_key and secrets.compare_digest(api_key, OCR_API_KEY):
+        return "admin"
+    return "guest"
 
 
 def require_auth(request: Request):
-    """Dependency: require valid session cookie."""
-    token = request.cookies.get("session")
-    username = validate_session(token)
-    if not username:
-        raise HTTPException(401, "Chưa đăng nhập")
-    return username
+    """Dependency: require admin session cookie or valid API key."""
+    role = get_current_user_role(request)
+    if role != "admin":
+        raise HTTPException(401, "Chưa đăng nhập quyền quản trị")
+    return role
 
 
 class LoginBody(BaseModel):
@@ -178,7 +301,7 @@ class LoginBody(BaseModel):
 
 @app.post("/api/auth/login")
 async def login(body: LoginBody, request: Request):
-    client_key = request.client.host if request.client else "unknown"
+    client_key = get_client_ip(request)
     now = time.time()
     attempts = _login_attempts[client_key]
     while attempts and attempts[0] < now - LOGIN_WINDOW_SECONDS:
@@ -222,9 +345,22 @@ async def check_auth(request: Request):
     return {"status": "ok", "username": username}
 
 
+# ── Client Quota Status Endpoint (Per Device) ──────────────────────
+@app.get("/api/quota/status")
+async def get_quota_status(request: Request, _user: str = Depends(require_auth)):
+    """Return real-time server-side quota status for the requesting machine/device."""
+    device_id = get_client_device_id(request)
+    stat = get_client_quota(device_id, max_daily=5)
+    return stat
+
+
 # ── Upload PDF ──────────────────────────────────────────────────────
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...), _user: str = Depends(require_auth)):
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    _user: str = Depends(require_auth),
+):
     filename = safe_upload_name(file.filename, {".pdf"})
     content = await read_upload_limited(file)
 
@@ -243,8 +379,8 @@ async def upload_file(file: UploadFile = File(...), _user: str = Depends(require
         if analysis.total_pages > MAX_PDF_PAGES:
             raise ValueError(f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}")
     except Exception as e:
-        await job_manager.update_job_status(job.job_id, JobStatus.FAILED)
         job.error = str(e)
+        await job_manager.update_job_status(job.job_id, JobStatus.FAILED)
         raise HTTPException(500, f"PDF analysis failed: {e}") from e
 
     job.total_pages = analysis.total_pages
@@ -268,22 +404,26 @@ async def upload_file(file: UploadFile = File(...), _user: str = Depends(require
     }
 
 
-# ── List All Jobs ──────────────────────────────────────────────────
+# ── List All Jobs (Admin only) ──────────────────────────────────────
 @app.get("/api/jobs")
 async def list_jobs(_user: str = Depends(require_auth)):
     return job_manager.list_jobs()
 
 
-# ── Get Job Status ─────────────────────────────────────────────────
+# ── Get Job Status ──────────────────────────────────────────────────
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str, include_text: bool = False, _user: str = Depends(require_auth)):
+async def get_job(
+    job_id: str,
+    include_text: bool = False,
+    _user: str = Depends(require_auth),
+):
     data = job_manager.get_job_dict(job_id, include_text=include_text)
     if not data:
         raise HTTPException(404, "Job not found")
     return data
 
 
-# ── Delete Job ─────────────────────────────────────────────────────
+# ── Delete Job (Admin only) ─────────────────────────────────────────
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str, _user: str = Depends(require_auth)):
     if not job_manager.delete_job(job_id):
@@ -297,10 +437,12 @@ async def start_ocr(
     job_id: str,
     pages: list[int] = Query(default=None, description="Page numbers to process"),
     mode: str = Query(default="all", description="all|odd|even|custom"),
-    _user: str = Depends(require_auth),
     force_method: str = Query(default=None, description="tesseract|vision|auto"),
     extract_images: bool = Query(default=False, description="Extract original images"),
+    _user: str = Depends(require_auth),
 ):
+    if _draining:
+        raise HTTPException(503, "Service is restarting; retry shortly")
     job = job_manager.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -327,12 +469,14 @@ async def start_ocr(
             job.pages[p_num].status = PageStatus.COMPLETED
             job.pages[p_num].method = "skipped"
             job_manager.persist_page(job.job_id, p_num)
-
     # Persist job state (selected_pages) to DB
     job_manager.persist_job(job.job_id)
 
     # Process in background
-    asyncio.create_task(_process_pages_limited(job, selected, force_method, extract_images))
+    _track_ocr_task(
+        _process_pages_limited(job, selected, force_method, extract_images),
+        f"ui-ocr-{job_id}",
+    )
 
     return {"job_id": job_id, "selected_pages": selected, "total": len(selected)}
 
@@ -578,14 +722,28 @@ async def _process_pages(job: Job, pages: list[int], force_method: str = None, e
 
 
 async def _process_pages_limited(job: Job, pages: list[int], force_method: str = None, extract_images: bool = False):
-    async with _job_semaphore:
-        await _process_pages(job, pages, force_method, extract_images)
+    try:
+        async with _job_semaphore:
+            await _process_pages(job, pages, force_method, extract_images)
+    except asyncio.CancelledError:
+        job.error = "Service restarted before OCR completed; submit the document again"
+        await job_manager.update_job_status(job.job_id, JobStatus.INTERRUPTED)
+        raise
+    except Exception as exc:
+        job.error = str(exc)
+        await job_manager.update_job_status(job.job_id, JobStatus.FAILED)
+        logger.exception("UI OCR job %s failed", job.job_id)
 
 
 
 # ── Page Thumbnail ──────────────────────────────────────────────────
 @app.get("/api/thumbnail/{job_id}/{page_num}")
-async def get_thumbnail(job_id: str, page_num: int, width: int = 200, _user: str = Depends(require_auth)):
+async def get_thumbnail(
+    job_id: str,
+    page_num: int,
+    width: int = 200,
+    _user: str = Depends(require_auth),
+):
     width = max(64, min(width, 1600))
     job = job_manager.get_job(job_id)
     filepath = job.filepath if job else None
@@ -609,7 +767,11 @@ async def get_thumbnail(job_id: str, page_num: int, width: int = 200, _user: str
 
 # ── Extracted Images Safe Serving ───────────────────────────────────
 @app.get("/api/extracted-images/{job_id}/{filename}")
-async def get_extracted_image(job_id: str, filename: str, _user: str = Depends(require_auth)):
+async def get_extracted_image(
+    job_id: str,
+    filename: str,
+    _user: str = Depends(require_auth),
+):
     """Serve an extracted image safely from the uploads directory."""
     import os
     # Sandbox check: prevent directory traversal
@@ -622,7 +784,11 @@ async def get_extracted_image(job_id: str, filename: str, _user: str = Depends(r
 
 # ── Download Results ────────────────────────────────────────────────
 @app.get("/api/download/{job_id}")
-async def download_results(job_id: str, format: str = "txt", _user: str = Depends(require_auth)):
+async def download_results(
+    job_id: str,
+    format: str = "txt",
+    _user: str = Depends(require_auth),
+):
     import urllib.parse
     export_format = (format or "txt").lower()
     if export_format == "text":
@@ -630,8 +796,8 @@ async def download_results(job_id: str, format: str = "txt", _user: str = Depend
     # Get full data including text
     data = job_manager.get_job_dict(job_id, include_text=True)
     if not data:
-        # Fallback to API jobs (in-memory)
-        data = _api_jobs.get(job_id)
+        # Fallback to durable API jobs.
+        data = _get_api_job(job_id)
         if not data:
             raise HTTPException(404, "Job not found")
 
@@ -771,6 +937,17 @@ async def download_results(job_id: str, format: str = "txt", _user: str = Depend
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f"attachment; filename*=utf-8''{filename_encoded}"},
         )
+    elif export_format in {"pdf", "translated_pdf"}:
+        job_filepath = data.get("filepath", "")
+        output_pdf = Path(job_filepath).parent / f"translated_{filename}"
+        if output_pdf.exists():
+            filename_encoded = urllib.parse.quote(f"translated_{filename}")
+            return FileResponse(
+                path=str(output_pdf),
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename*=utf-8''{filename_encoded}"},
+            )
+        raise HTTPException(404, "Translated PDF not found. Please run translation first.")
     else:
         lines = []
         for num in sorted(pages.keys(), key=int):
@@ -834,14 +1011,155 @@ def _html_to_markdown(html: str) -> str:
     return t.strip()
 
 
+# ── Book Translation Engine (AegisTrans Layout & Image Preservation) ──────
+async def _process_translation_task(
+    job: Job,
+    mode: str,
+    glossary_profile: str,
+    model: str | None,
+    selected_pages: list[int],
+):
+    output_dir = Path(job.filepath).parent
+    output_pdf = output_dir / f"translated_{job.filename}"
+
+    async def progress_cb(current: int, total: int, msg: str):
+        job.status = JobStatus.PROCESSING
+        await job_manager.broadcast(
+            job.job_id,
+            {
+                "type": "translation_progress",
+                "current": current,
+                "total": total,
+                "message": msg,
+            },
+        )
+
+    try:
+        page_indices = [p - 1 for p in selected_pages]
+        res = await translate_pdf_book(
+            input_pdf_path=job.filepath,
+            output_pdf_path=output_pdf,
+            mode=mode,
+            glossary_profile=glossary_profile,
+            model=model,
+            pages=page_indices,
+            progress_callback=progress_cb,
+        )
+        job.status = JobStatus.COMPLETED
+        job.completed_at = time.time()
+        job_manager.persist_job(job.job_id)
+        await job_manager.broadcast(
+            job.job_id,
+            {
+                "type": "translation_completed",
+                "result": res,
+                "download_url": f"/api/translate/{job.job_id}/download",
+            },
+        )
+    except Exception as e:
+        logger.exception("Translation job %s failed: %s", job.job_id, e)
+        job.status = JobStatus.FAILED
+        job.error = str(e)
+        job_manager.persist_job(job.job_id)
+        await job_manager.broadcast(
+            job.job_id,
+            {
+                "type": "translation_failed",
+                "error": str(e),
+            },
+        )
+
+
+@app.post("/api/translate/{job_id}")
+async def start_book_translation(
+    job_id: str,
+    mode: str = Query(default="inplace", description="inplace | bilingual_dual"),
+    glossary_profile: str = Query(default="general", description="general | medical | dental"),
+    model: str = Query(default=None, description="GPT model from 9router (e.g. gpt-5.6-luna)"),
+    pages: list[int] = Query(default=None, description="Page numbers to translate (1-indexed)"),
+    _user: str = Depends(require_auth),
+):
+    """Start high-fidelity PDF book translation strictly preserving images and layout."""
+    if _draining:
+        raise HTTPException(503, "Service is restarting; retry shortly")
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status == JobStatus.PROCESSING:
+        raise HTTPException(409, "Job is already processing")
+
+    selected = pages if pages else list(range(1, job.total_pages + 1))
+    job.selected_pages = selected
+    job.status = JobStatus.PROCESSING
+    job.started_at = time.time()
+    job_manager.persist_job(job.job_id)
+
+    _track_ocr_task(
+        _process_translation_task(job, mode, glossary_profile, model, selected),
+        f"ui-translate-{job_id}",
+    )
+    return {
+        "job_id": job_id,
+        "mode": mode,
+        "glossary_profile": glossary_profile,
+        "model": model or os.getenv("SMART_PDF_GPT_MODEL", "gpt-5.6-luna"),
+        "selected_pages": selected,
+        "total_selected": len(selected),
+    }
+
+
+@app.get("/api/translate/{job_id}/download")
+async def download_translated_pdf_file(
+    job_id: str,
+    _user: str = Depends(require_auth),
+):
+    """Download translated PDF with layout and images preserved."""
+    import urllib.parse
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    output_pdf = Path(job.filepath).parent / f"translated_{job.filename}"
+    if not output_pdf.exists():
+        raise HTTPException(404, "Translated PDF not found or still processing")
+
+    filename_encoded = urllib.parse.quote(f"translated_{job.filename}")
+    return FileResponse(
+        path=str(output_pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=utf-8''{filename_encoded}"},
+    )
+
+
+@app.get("/api/v1/models/gpt")
+async def list_available_gpt_models():
+    """List configured 9router GPT translation models."""
+    base_url, api_key, active_model = get_llm_config()
+    return {
+        "active_model": active_model,
+        "base_url": base_url,
+        "configured": bool(base_url and api_key),
+        "supported_models": [
+            "gh/gpt-5.4-mini",
+            "gh/gpt-5.4",
+            "gpt-5.6-luna",
+            "model-chinh",
+            "image-vision",
+        ],
+    }
+
+
 # ── WebSocket for real-time progress ───────────────────────────────
 @app.websocket("/ws/{job_id}")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
     token = websocket.cookies.get("session")
-    origin = websocket.headers.get("origin", "")
-    if not validate_session(token) or (origin and origin not in CORS_ORIGINS):
+    origin = websocket.headers.get("origin")
+    host = websocket.headers.get("host", "")
+    same_origin = origin in {f"http://{host}", f"https://{host}"}
+    if not validate_session(token) or (origin and not same_origin and origin not in CORS_ORIGINS):
         await websocket.close(code=4401)
         return
+
     job = job_manager.get_job(job_id)
     if not job:
         await websocket.close(code=4004)
@@ -864,20 +1182,9 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
         await job_manager.remove_websocket(job_id, websocket)
 
 
-# ── Simple OCR API (async job pattern, for OpenClaw / external) ────
+# ── Simple OCR API (async job pattern, for MCP / external clients) ─
 OCR_API_KEY = os.getenv("OCR_API_KEY", "")
 
-# In-memory store for API OCR jobs (auto-cleanup after 1h)
-_api_jobs: dict[str, dict] = {}
-_batch_jobs: dict[str, dict] = {}
-
-async def _delayed_cleanup_api_job(job_id: str):
-    await asyncio.sleep(3600)
-    _api_jobs.pop(job_id, None)
-
-async def _delayed_cleanup_batch_job(batch_id: str):
-    await asyncio.sleep(3600)
-    _batch_jobs.pop(batch_id, None)
 
 def require_api_key(request: Request):
     """Dependency: require valid API key via X-API-Key header."""
@@ -887,65 +1194,103 @@ def require_api_key(request: Request):
     return True
 
 
+# Hot cache backed by SQLite. Completed results remain available after restart.
+_api_jobs: dict[str, dict] = {}
+_batch_jobs: dict[str, dict] = {}
+
+
+def _get_api_job(job_id: str) -> dict | None:
+    job = _api_jobs.get(job_id) or load_api_job(job_id)
+    if job:
+        _api_jobs[job_id] = job
+    return job
+
+
+def _get_api_batch(batch_id: str) -> dict | None:
+    batch = _batch_jobs.get(batch_id) or load_api_batch(batch_id)
+    if batch:
+        _batch_jobs[batch_id] = batch
+    return batch
+
+
+def _finish_api_record(record: dict, status: str, error: str | None = None) -> None:
+    now = time.time()
+    record["status"] = status
+    record["completed_at"] = now
+    record["expires_at"] = now + API_JOB_RETENTION_SECONDS
+    if error is not None:
+        record["error"] = error
+
+
+def _select_api_pages(spec: str, total_pages: int) -> list[int]:
+    all_pages = list(range(1, total_pages + 1))
+    if spec == "all":
+        return all_pages
+    if spec == "odd":
+        return [page for page in all_pages if page % 2 == 1]
+    if spec == "even":
+        return [page for page in all_pages if page % 2 == 0]
+    selected = [int(part.strip()) for part in spec.split(",") if part.strip().isdigit()]
+    return [page for page in selected if 1 <= page <= total_pages]
+
+
 @app.post("/api/v1/ocr")
 async def simple_ocr_submit(
-    request: Request,
     file: UploadFile = File(...),
     pages: str = Query(default="all", description="Pages: all, 1,3,5, odd, even"),
     method: str = Query(default="auto", description="auto|tesseract|vision"),
     extract_images: bool = Query(default=False, description="Extract original images"),
     _auth: bool = Depends(require_api_key),
 ):
-    """Submit PDF for OCR. Returns job_id for polling."""
+    """Submit a PDF for OCR and return a durable polling identifier."""
+    if _draining:
+        raise HTTPException(503, "Service is restarting; retry shortly")
+    if method not in {"auto", "tesseract", "vision"}:
+        raise HTTPException(400, "method must be auto, tesseract, or vision")
+
     filename = safe_upload_name(file.filename, {".pdf"})
     content = await read_upload_limited(file)
-
-    # Save file
     filepath = UPLOAD_DIR / f"api_{uuid.uuid4().hex[:12]}_{filename}"
-    with open(filepath, "wb") as f:
-        f.write(content)
+    with open(filepath, "wb") as output:
+        output.write(content)
 
-    # Analyze PDF
     try:
         analysis = analyze_pdf(str(filepath))
         if analysis.total_pages > MAX_PDF_PAGES:
             raise ValueError(f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}")
-    except Exception as e:
-        os.remove(filepath)
-        raise HTTPException(500, f"PDF analysis failed: {e}") from e
+    except Exception as exc:
+        filepath.unlink(missing_ok=True)
+        raise HTTPException(400, f"PDF analysis failed: {exc}") from exc
 
-    # Determine pages
-    all_pages = list(range(1, analysis.total_pages + 1))
-    if pages == "all":
-        selected = all_pages
-    elif pages == "odd":
-        selected = [p for p in all_pages if p % 2 == 1]
-    elif pages == "even":
-        selected = [p for p in all_pages if p % 2 == 0]
-    else:
-        selected = [int(p.strip()) for p in pages.split(",") if p.strip().isdigit()]
-        selected = [p for p in selected if 1 <= p <= analysis.total_pages]
-
+    selected = _select_api_pages(pages, analysis.total_pages)
     if not selected:
-        os.remove(filepath)
+        filepath.unlink(missing_ok=True)
         raise HTTPException(400, "No valid pages selected")
 
-    # Create job
-    import time as _time
+    now = time.time()
     job_id = uuid.uuid4().hex[:12]
-    _api_jobs[job_id] = {
+    job = {
         "status": "processing",
         "filename": filename,
         "filepath": str(filepath),
         "total_pages": len(selected),
         "completed_pages": 0,
-        "created_at": _time.time(),
+        "selected_pages": selected,
+        "method": method,
+        "pages": {},
+        "created_at": now,
+        "started_at": now,
+        "completed_at": None,
+        "expires_at": None,
         "html_result": None,
         "error": None,
     }
-
-    # Process in background
-    asyncio.create_task(_run_api_ocr_and_cleanup(job_id, str(filepath), filename, selected, method, analysis, extract_images))
+    _api_jobs[job_id] = job
+    save_api_job(job_id, job)
+    _track_ocr_task(
+        _run_api_ocr(job_id, str(filepath), filename, selected, method, analysis, extract_images),
+        f"api-ocr-{job_id}",
+    )
 
     return {
         "job_id": job_id,
@@ -955,217 +1300,160 @@ async def simple_ocr_submit(
         "poll_url": f"/api/v1/ocr/{job_id}",
     }
 
-async def _run_api_ocr_and_cleanup(job_id, filepath, filename, selected, method, analysis, extract_images):
+
+async def _run_api_ocr(job_id, filepath, filename, selected, method, analysis, extract_images):
     async with _job_semaphore:
-        await _api_ocr_process(job_id, filepath, filename, selected, method, analysis, extract_images)
-    asyncio.create_task(_delayed_cleanup_api_job(job_id))
+        await _api_ocr_process(
+            job_id, filepath, filename, selected, method, analysis, extract_images
+        )
 
-async def _api_ocr_process(job_id: str, filepath: str, filename: str, selected: list[int], method: str, analysis, extract_images: bool = False):
-    """Background: OCR selected pages with 2-phase parallel batch architecture.
 
-    Phase 1: Handle digital/tesseract pages sequentially (fast, no API calls).
-    Phase 2: Collect vision-destined pages, batch and run in parallel.
-    """
-    job = _api_jobs[job_id]
+async def _api_ocr_process(
+    job_id: str,
+    filepath: str,
+    filename: str,
+    selected: list[int],
+    method: str,
+    analysis,
+    extract_images: bool = False,
+):
+    """OCR selected pages and persist progress after every completed page."""
+    job = _get_api_job(job_id)
+    if not job:
+        raise RuntimeError(f"API job {job_id} disappeared")
     force = method if method != "auto" else None
+    page_results_map = {int(page): result for page, result in job.get("pages", {}).items()}
+
+    def record_page(page_num: int, result: dict) -> None:
+        raw_html = result.get("html_text", f"<pre>{result.get('text', '')}</pre>")
+        enriched_html = _enrich_html_with_images(
+            job_id, page_num, filepath, raw_html, extract_images
+        )
+        page_results_map[page_num] = {
+            "page": page_num,
+            "method": result["method"],
+            "confidence": result["confidence"],
+            "text": result.get("text", ""),
+            "html_text": enriched_html,
+        }
+        job["pages"] = {str(page): value for page, value in page_results_map.items()}
+        job["completed_pages"] = len(page_results_map)
+        save_api_job(job_id, job)
 
     try:
-        # Dict to collect results keyed by page_num (for ordered output)
-        page_results_map = {}
-        vision_pages = []  # collect (page_num, image) for batched vision
-
-        # ── Phase 1: Digital + Tesseract (fast, sequential) ──
+        vision_pages = []
         for page_num in selected:
-            page_info = next((p for p in analysis.pages if p.page_num == page_num), None)
+            page_info = next((page for page in analysis.pages if page.page_num == page_num), None)
             classification = page_info.classification if page_info else "scan_complex"
 
-            # Digital pages: extract text directly (no OCR)
             if classification == "digital" and force != "vision":
                 text = extract_page_text(filepath, page_num)
-                raw_html = f"<pre>{text}</pre>"
-                enriched_html = _enrich_html_with_images(job_id, page_num, filepath, raw_html, extract_images)
-                
-                page_results_map[page_num] = {
-                    "page": page_num,
-                    "method": "digital",
-                    "confidence": 100.0,
-                    "text": text,
-                    "html_text": enriched_html,
-                }
-                job["completed_pages"] = len(page_results_map)
+                record_page(
+                    page_num,
+                    {"method": "digital", "confidence": 100.0, "text": text},
+                )
                 continue
 
-            # Force tesseract: process individually
             if force == "tesseract":
                 image = render_page_to_image(filepath, page_num)
-                result = await smart_ocr(image, classification, force_method="tesseract")
-                
-                raw_html = result.get("html_text", f"<pre>{result['text']}</pre>")
-                enriched_html = _enrich_html_with_images(job_id, page_num, filepath, raw_html, extract_images)
-                
-                page_results_map[page_num] = {
-                    "page": page_num,
-                    "method": result["method"],
-                    "confidence": result["confidence"],
-                    "text": result.get("text", ""),
-                    "html_text": enriched_html,
-                }
-                job["completed_pages"] = len(page_results_map)
+                record_page(
+                    page_num,
+                    await smart_ocr(image, classification, force_method="tesseract"),
+                )
                 continue
 
-            # Simple scans in auto mode: try Tesseract first
             if classification == "scan_simple" and force != "vision":
                 image = render_page_to_image(filepath, page_num)
-                result = await smart_ocr(image, classification, force_method=None)
-                if result["method"] == "tesseract":
-                    # Tesseract was good enough
-                    raw_html = result.get("html_text", f"<pre>{result['text']}</pre>")
-                    enriched_html = _enrich_html_with_images(job_id, page_num, filepath, raw_html, extract_images)
-                    
-                    page_results_map[page_num] = {
-                        "page": page_num,
-                        "method": result["method"],
-                        "confidence": result["confidence"],
-                        "text": result.get("text", ""),
-                        "html_text": enriched_html,
-                    }
-                    job["completed_pages"] = len(page_results_map)
-                    continue
-                # smart_ocr already fell back to vision — use that result
-                raw_html = result.get("html_text", f"<pre>{result['text']}</pre>")
-                enriched_html = _enrich_html_with_images(job_id, page_num, filepath, raw_html, extract_images)
-                
-                page_results_map[page_num] = {
-                    "page": page_num,
-                    "method": result["method"],
-                    "confidence": result["confidence"],
-                    "text": result.get("text", ""),
-                    "html_text": enriched_html,
-                }
-                job["completed_pages"] = len(page_results_map)
+                record_page(page_num, await smart_ocr(image, classification, force_method=None))
                 continue
 
-            # Vision-destined: collect for parallel batching
-            image = render_page_to_image(filepath, page_num)
-            vision_pages.append((page_num, image))
+            vision_pages.append((page_num, render_page_to_image(filepath, page_num)))
 
-        # ── Phase 2: Vision batch parallel ──
         if vision_pages:
             batches = [
-                vision_pages[i:i + BATCH_SIZE]
-                for i in range(0, len(vision_pages), BATCH_SIZE)
+                vision_pages[index:index + BATCH_SIZE]
+                for index in range(0, len(vision_pages), BATCH_SIZE)
             ]
-
             logger.info(
-                f"API Job {job_id}: {len(vision_pages)} vision pages → "
-                f"{len(batches)} batches (size={BATCH_SIZE}), "
-                f"parallel={PARALLEL_BATCHES}"
+                "API job %s: %s vision pages in %s batches (parallel=%s)",
+                job_id,
+                len(vision_pages),
+                len(batches),
+                PARALLEL_BATCHES,
             )
 
-            async def _run_batch(batch):
+            async def run_batch(batch):
                 results = await vision_ocr_batch(batch)
-                for (pn, _img), result in zip(batch, results, strict=True):
-                    raw_html = result.get("html_text", f"<pre>{result['text']}</pre>")
-                    enriched_html = _enrich_html_with_images(job_id, pn, filepath, raw_html, extract_images)
-                    
-                    page_results_map[pn] = {
-                        "page": pn,
-                        "method": result["method"],
-                        "confidence": result["confidence"],
-                        "text": result.get("text", ""),
-                        "html_text": enriched_html,
-                    }
-                    job["completed_pages"] = len(page_results_map)
+                for (page_num, _image), result in zip(batch, results, strict=True):
+                    record_page(page_num, result)
 
-            # Run batches in parallel waves
             for wave_start in range(0, len(batches), PARALLEL_BATCHES):
                 wave = batches[wave_start:wave_start + PARALLEL_BATCHES]
-                await asyncio.gather(*[_run_batch(b) for b in wave])
+                await asyncio.gather(*(run_batch(batch) for batch in wave))
 
-        # ── Build HTML from ordered results ──
-        page_results = [page_results_map[p] for p in selected if p in page_results_map]
-
+        page_results = [page_results_map[page] for page in selected if page in page_results_map]
         html_parts = [
-            '<!DOCTYPE html>',
-            '<html lang="vi">',
-            '<head>',
-            f'<title>OCR: {filename}</title>',
+            "<!DOCTYPE html>",
+            '<html lang="vi"><head>',
+            f"<title>OCR: {filename}</title>",
             '<meta charset="utf-8">',
-            '<style>',
-            'body { font-family: Georgia, serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #fafafa; color: #333; }',
-            '.page { background: white; padding: 30px; margin: 20px 0; border: 1px solid #ddd; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }',
-            '.page-header { border-bottom: 2px solid #eee; padding-bottom: 8px; margin-bottom: 16px; font-size: 14px; color: #888; }',
-            'table { border-collapse: collapse; width: 100%; }',
-            'td, th { border: 1px solid #ccc; padding: 6px 10px; }',
-            '</style>',
-            '</head>',
-            '<body>',
-            f'<h1>📄 {filename}</h1>',
+            "<style>body{font-family:Georgia,serif;max-width:900px;margin:0 auto;padding:20px;background:#fafafa;color:#333}"
+            ".page{background:white;padding:30px;margin:20px 0;border:1px solid #ddd}"
+            ".page-header{border-bottom:2px solid #eee;padding-bottom:8px;margin-bottom:16px;color:#888}"
+            "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px}</style>",
+            "</head><body>",
+            f"<h1>📄 {filename}</h1>",
             f'<p style="color:#888">Pages: {len(page_results)} | Method: {method}</p>',
         ]
-        for p in page_results:
-            html_parts.append('<div class="page">')
-            html_parts.append(f'<div class="page-header">Trang {p["page"]} · {p["method"]} · {p["confidence"]}%</div>')
-            html_parts.append(p["html_text"])
-            html_parts.append('</div>')
-        html_parts.append('</body></html>')
-
-        html_content = '\n'.join(html_parts)
-        if extract_images:
-            html_content = inline_base64_images(html_content, job_id)
-        job["html_result"] = html_content
-        job["pages"] = {
-            str(pn): {
-                "text": res.get("text", ""),
-                "html_text": res["html_text"],
-                "method": res["method"],
-                "confidence": res["confidence"]
-            }
-            for pn, res in page_results_map.items()
-        }
-        job["status"] = "completed"
-
-    except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)
-
+        for result in page_results:
+            html_parts.extend(
+                [
+                    '<div class="page">',
+                    f'<div class="page-header">Trang {result["page"]} · {result["method"]} · {result["confidence"]}%</div>',
+                    result["html_text"],
+                    "</div>",
+                ]
+            )
+        html_parts.append("</body></html>")
+        html_content = "\n".join(html_parts)
+        job["html_result"] = inline_base64_images(html_content, job_id) if extract_images else html_content
+        _finish_api_record(job, "completed")
+    except asyncio.CancelledError:
+        _finish_api_record(
+            job,
+            "interrupted",
+            "Service restarted before OCR completed; submit the document again",
+        )
+        raise
+    except Exception as exc:
+        _finish_api_record(job, "failed", str(exc))
+        logger.exception("API OCR job %s failed", job_id)
     finally:
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except OSError:
-            pass
+        Path(filepath).unlink(missing_ok=True)
+        job["filepath"] = ""
+        save_api_job(job_id, job)
 
 
 @app.get("/api/v1/ocr/{job_id}")
-async def simple_ocr_status(
-    job_id: str,
-    _auth: bool = Depends(require_api_key),
-):
+async def simple_ocr_status(job_id: str, _auth: bool = Depends(require_api_key)):
+    """Poll OCR job status. Completed jobs return the generated HTML."""
     import urllib.parse
-    """Poll OCR job status. Returns HTML file when completed."""
-    job = _api_jobs.get(job_id)
+
+    job = _get_api_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found or expired")
-
     if job["status"] == "processing":
         return {
             "job_id": job_id,
             "status": "processing",
             "progress": f"{job['completed_pages']}/{job['total_pages']}",
         }
+    if job["status"] in {"failed", "interrupted"}:
+        return {"job_id": job_id, "status": job["status"], "error": job["error"]}
 
-    if job["status"] == "failed":
-        return {
-            "job_id": job_id,
-            "status": "failed",
-            "error": job["error"],
-        }
-
-    # Completed — return HTML file
     filename_encoded = urllib.parse.quote(f"{job['filename']}_ocr.html")
     return Response(
-        content=job["html_result"],
+        content=job["html_result"] or "",
         media_type="text/html; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename*=utf-8''{filename_encoded}"},
     )
@@ -1173,150 +1461,210 @@ async def simple_ocr_status(
 
 @app.post("/api/v1/ocr/batch")
 async def batch_ocr_submit(
-    request: Request,
     files: list[UploadFile] = File(...),
     method: str = Query(default="auto", description="auto|tesseract|vision"),
     _auth: bool = Depends(require_api_key),
 ):
-    """Submit multiple PDFs for OCR. Returns batch_id for polling."""
+    """Submit multiple PDFs for OCR and return a durable batch identifier."""
+    if _draining:
+        raise HTTPException(503, "Service is restarting; retry shortly")
     if not files or len(files) > 10:
         raise HTTPException(400, "Batch must contain between 1 and 10 PDF files")
+    if method not in {"auto", "tesseract", "vision"}:
+        raise HTTPException(400, "method must be auto, tesseract, or vision")
+
     batch_id = uuid.uuid4().hex[:12]
-    
     saved_files = []
-    for f in files:
-        filename = safe_upload_name(f.filename, {".pdf"})
-        content = await read_upload_limited(f)
-        filepath = UPLOAD_DIR / f"batch_{batch_id}_{uuid.uuid4().hex[:12]}_{filename}"
-        with open(filepath, "wb") as out:
-            out.write(content)
-        saved_files.append((str(filepath), filename))
-            
-    if not saved_files:
-        raise HTTPException(400, "No valid PDF files uploaded")
-        
-    import time as _time
-    _batch_jobs[batch_id] = {
+    try:
+        for upload in files:
+            filename = safe_upload_name(upload.filename, {".pdf"})
+            content = await read_upload_limited(upload)
+            filepath = UPLOAD_DIR / f"batch_{batch_id}_{uuid.uuid4().hex[:12]}_{filename}"
+            with open(filepath, "wb") as output:
+                output.write(content)
+            saved_files.append((str(filepath), filename))
+    except Exception:
+        for filepath, _filename in saved_files:
+            Path(filepath).unlink(missing_ok=True)
+        raise
+
+    now = time.time()
+    batch = {
         "status": "processing",
         "total_files": len(saved_files),
         "completed_files": 0,
         "results": [],
-        "created_at": _time.time(),
+        "created_at": now,
+        "completed_at": None,
+        "expires_at": None,
         "error": None,
     }
-    
-    asyncio.create_task(_process_batch_task(batch_id, saved_files, method))
-    
+    _batch_jobs[batch_id] = batch
+    save_api_batch(batch_id, batch)
+    _track_ocr_task(_process_batch_task(batch_id, saved_files, method), f"api-batch-{batch_id}")
+
     return {
         "batch_id": batch_id,
         "status": "processing",
         "total_files": len(saved_files),
-        "poll_url": f"/api/v1/ocr/batch/{batch_id}"
+        "poll_url": f"/api/v1/ocr/batch/{batch_id}",
     }
 
+
 async def _process_batch_task(batch_id: str, saved_files: list, method: str):
-    import time as _time
-    batch = _batch_jobs[batch_id]
-    
-    for filepath, filename in saved_files:
-        try:
-            analysis = analyze_pdf(filepath)
-            if analysis.total_pages > MAX_PDF_PAGES:
-                raise ValueError(f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}")
-            selected = list(range(1, analysis.total_pages + 1))
-            
-            job_id = uuid.uuid4().hex[:12]
-            _api_jobs[job_id] = {
-                "status": "processing",
-                "filename": filename,
-                "filepath": filepath,
-                "total_pages": len(selected),
-                "completed_pages": 0,
-                "created_at": _time.time(),
-                "html_result": None,
-                "error": None,
-            }
-            # Process sequentially to bound memory usage
-            async with _job_semaphore:
-                await _api_ocr_process(job_id, filepath, filename, selected, method, analysis)
-            asyncio.create_task(_delayed_cleanup_api_job(job_id))
-            
-            job = _api_jobs[job_id]
-            batch["results"].append({
-                "filename": filename,
-                "status": job["status"],
-                "html_result": job.get("html_result"),
-                "error": job.get("error")
-            })
-            
-        except Exception as e:
-            batch["results"].append({
-                "filename": filename,
-                "status": "failed",
-                "error": str(e)
-            })
-        finally:
-            batch["completed_files"] += 1
-            if os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
-                    
-    batch["status"] = "completed"
-    asyncio.create_task(_delayed_cleanup_batch_job(batch_id))
+    batch = _get_api_batch(batch_id)
+    if not batch:
+        raise RuntimeError(f"API batch {batch_id} disappeared")
+    try:
+        for filepath, filename in saved_files:
+            item_finished = False
+            try:
+                analysis = analyze_pdf(filepath)
+                if analysis.total_pages > MAX_PDF_PAGES:
+                    raise ValueError(
+                        f"PDF has {analysis.total_pages} pages; maximum is {MAX_PDF_PAGES}"
+                    )
+                selected = list(range(1, analysis.total_pages + 1))
+                now = time.time()
+                job_id = uuid.uuid4().hex[:12]
+                job = {
+                    "status": "processing",
+                    "filename": filename,
+                    "filepath": filepath,
+                    "total_pages": len(selected),
+                    "completed_pages": 0,
+                    "selected_pages": selected,
+                    "method": method,
+                    "pages": {},
+                    "created_at": now,
+                    "started_at": now,
+                    "completed_at": None,
+                    "expires_at": None,
+                    "html_result": None,
+                    "error": None,
+                }
+                _api_jobs[job_id] = job
+                save_api_job(job_id, job)
+                async with _job_semaphore:
+                    await _api_ocr_process(job_id, filepath, filename, selected, method, analysis)
+                batch["results"].append(
+                    {
+                        "job_id": job_id,
+                        "filename": filename,
+                        "status": job["status"],
+                        "html_result": job.get("html_result"),
+                        "error": job.get("error"),
+                    }
+                )
+                item_finished = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Batch %s failed to process %s", batch_id, filename)
+                batch["results"].append(
+                    {"filename": filename, "status": "failed", "error": str(exc)}
+                )
+                item_finished = True
+            finally:
+                if item_finished:
+                    batch["completed_files"] += 1
+                Path(filepath).unlink(missing_ok=True)
+                save_api_batch(batch_id, batch)
+        _finish_api_record(batch, "completed")
+    except asyncio.CancelledError:
+        _finish_api_record(
+            batch,
+            "interrupted",
+            "Service restarted before batch OCR completed; submit the batch again",
+        )
+        raise
+    finally:
+        for filepath, _filename in saved_files:
+            Path(filepath).unlink(missing_ok=True)
+        save_api_batch(batch_id, batch)
 
 
 @app.get("/api/v1/ocr/batch/{batch_id}")
 async def batch_ocr_status(batch_id: str, _auth: bool = Depends(require_api_key)):
-    if batch_id not in _batch_jobs:
+    data = _get_api_batch(batch_id)
+    if not data:
         raise HTTPException(404, "Batch job not found")
-    data = _batch_jobs[batch_id]
     return {
         "batch_id": batch_id,
         "status": data["status"],
         "total_files": data["total_files"],
         "completed_files": data["completed_files"],
-        "error": data["error"]
+        "error": data["error"],
     }
 
 
 @app.get("/api/v1/ocr/batch/{batch_id}/download")
-async def batch_ocr_download(batch_id: str, format: str = "zip", _auth: bool = Depends(require_api_key)):
-    if batch_id not in _batch_jobs:
+async def batch_ocr_download(
+    batch_id: str,
+    format: str = "zip",
+    _auth: bool = Depends(require_api_key),
+):
+    data = _get_api_batch(batch_id)
+    if not data:
         raise HTTPException(404, "Batch job not found")
-    data = _batch_jobs[batch_id]
-    
     if data["status"] != "completed":
-        raise HTTPException(400, "Batch job is not yet completed")
-        
+        raise HTTPException(400, f"Batch job is {data['status']}")
+
     if format == "json":
         import json
+
         return Response(
             content=json.dumps(data["results"], ensure_ascii=False, indent=2),
             media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="batch_{batch_id}_results.json"'}
+            headers={"Content-Disposition": f'attachment; filename="batch_{batch_id}_results.json"'},
         )
-        
-    # Default to zip containing HTML files
+
     import io
     import zipfile
-    
+
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        for res in data["results"]:
-            fname = res["filename"]
-            if res["status"] == "completed" and res["html_result"]:
-                zip_file.writestr(f"{fname}.html", res["html_result"].encode('utf-8'))
+        for result in data["results"]:
+            filename = result["filename"]
+            if result["status"] == "completed" and result.get("html_result"):
+                zip_file.writestr(f"{filename}.html", result["html_result"].encode("utf-8"))
             else:
-                error_msg = res.get("error", "Unknown error")
-                zip_file.writestr(f"{fname}_ERROR.txt", error_msg.encode('utf-8'))
-                
+                zip_file.writestr(
+                    f"{filename}_ERROR.txt",
+                    result.get("error", "Unknown error").encode("utf-8"),
+                )
+
     return Response(
         content=zip_buffer.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="batch_{batch_id}_results.zip"'}
+        headers={"Content-Disposition": f'attachment; filename="batch_{batch_id}_results.zip"'},
     )
+
+
+@app.post("/api/v1/pdf/metadata")
+async def pdf_metadata_endpoint(
+    file: UploadFile = File(...),
+    _auth: bool = Depends(require_api_key),
+):
+    """Extract zero-token academic metadata, DOI, arXiv, PMID, and text structure from PDF."""
+    filename = safe_upload_name(file.filename, {".pdf"})
+    content = await read_upload_limited(file)
+    filepath = UPLOAD_DIR / f"meta_{uuid.uuid4().hex[:12]}_{filename}"
+    try:
+        with open(filepath, "wb") as f:
+            f.write(content)
+        meta = extract_pdf_metadata(str(filepath))
+        return {
+            "status": "ok",
+            "filename": filename,
+            "metadata": meta,
+        }
+    finally:
+        if filepath.exists():
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
 
 
 @app.post("/api/v1/latex/compile")

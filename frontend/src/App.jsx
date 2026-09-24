@@ -251,7 +251,7 @@ export default function App() {
         if (msg.summary) setSummary(msg.summary)
       } else if (msg.type === 'job_update') {
         if (msg.summary) setSummary(msg.summary)
-        if (msg.status === 'completed' || msg.status === 'failed') {
+        if (['completed', 'failed', 'interrupted'].includes(msg.status)) {
           setProcessing(false)
           clearInterval(timerRef.current)
           if (msg.elapsed_time) setElapsed(msg.elapsed_time)
@@ -478,8 +478,8 @@ export default function App() {
                   <div key={j.job_id} className="dashboard-card">
                     <div className="dashboard-card-header">
                       <span className="dashboard-filename">📄 {j.filename}</span>
-                      <span className={`badge ${j.status === 'completed' ? 'success' : j.status === 'processing' ? 'warning' : j.status === 'failed' ? 'error' : ''}`}>
-                        {j.status === 'completed' ? '✅ Hoàn thành' : j.status === 'processing' ? '⏳ Đang xử lý' : j.status === 'failed' ? '❌ Lỗi' : '⏸ Chờ'}
+                      <span className={`badge ${j.status === 'completed' ? 'success' : j.status === 'processing' ? 'warning' : ['failed', 'interrupted'].includes(j.status) ? 'error' : ''}`}>
+                        {j.status === 'completed' ? '✅ Hoàn thành' : j.status === 'processing' ? '⏳ Đang xử lý' : j.status === 'failed' ? '❌ Lỗi' : j.status === 'interrupted' ? '⚠️ Bị gián đoạn' : '⏸ Chờ'}
                       </span>
                     </div>
                     <div className="dashboard-card-meta">

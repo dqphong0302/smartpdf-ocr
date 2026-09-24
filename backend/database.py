@@ -1,11 +1,12 @@
 """SQLite database for persisting OCR job history."""
 import json
 import os
+import shutil
 import sqlite3
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "data" / "ocr_history.db"
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(Path(__file__).parent / "data" / "ocr_history.db")))
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -50,9 +51,286 @@ def init_db():
             PRIMARY KEY (job_id, page_num),
             FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS client_quotas (
+            client_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            request_count INTEGER DEFAULT 0,
+            total_pages INTEGER DEFAULT 0,
+            last_request_at REAL NOT NULL,
+            PRIMARY KEY (client_id, usage_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS api_jobs (
+            job_id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            filepath TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'processing',
+            total_pages INTEGER NOT NULL DEFAULT 0,
+            completed_pages INTEGER NOT NULL DEFAULT 0,
+            selected_pages TEXT NOT NULL DEFAULT '[]',
+            method TEXT NOT NULL DEFAULT 'auto',
+            pages_json TEXT NOT NULL DEFAULT '{}',
+            html_result TEXT,
+            created_at REAL NOT NULL,
+            started_at REAL,
+            completed_at REAL,
+            expires_at REAL,
+            error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS api_batches (
+            batch_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'processing',
+            total_files INTEGER NOT NULL DEFAULT 0,
+            completed_files INTEGER NOT NULL DEFAULT 0,
+            results_json TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            completed_at REAL,
+            expires_at REAL,
+            error TEXT
+        );
+
+        PRAGMA user_version = 2;
     """)
     conn.commit()
     conn.close()
+
+
+def save_api_job(job_id: str, job: dict) -> None:
+    """Persist an API OCR job so status and results survive process restarts."""
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO api_jobs (
+            job_id, filename, filepath, status, total_pages, completed_pages,
+            selected_pages, method, pages_json, html_result, created_at,
+            started_at, completed_at, expires_at, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            filename=excluded.filename,
+            filepath=excluded.filepath,
+            status=excluded.status,
+            total_pages=excluded.total_pages,
+            completed_pages=excluded.completed_pages,
+            selected_pages=excluded.selected_pages,
+            method=excluded.method,
+            pages_json=excluded.pages_json,
+            html_result=excluded.html_result,
+            started_at=excluded.started_at,
+            completed_at=excluded.completed_at,
+            expires_at=excluded.expires_at,
+            error=excluded.error
+        """,
+        (
+            job_id,
+            job.get("filename", ""),
+            job.get("filepath", ""),
+            job.get("status", "processing"),
+            int(job.get("total_pages", 0)),
+            int(job.get("completed_pages", 0)),
+            json.dumps(job.get("selected_pages", [])),
+            job.get("method", "auto"),
+            json.dumps(job.get("pages", {}), ensure_ascii=False),
+            job.get("html_result"),
+            float(job.get("created_at", time.time())),
+            job.get("started_at"),
+            job.get("completed_at"),
+            job.get("expires_at"),
+            job.get("error"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_api_job(job_id: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM api_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    result["selected_pages"] = json.loads(result.pop("selected_pages") or "[]")
+    result["pages"] = json.loads(result.pop("pages_json") or "{}")
+    return result
+
+
+def save_api_batch(batch_id: str, batch: dict) -> None:
+    """Persist API batch metadata and child results."""
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO api_batches (
+            batch_id, status, total_files, completed_files, results_json,
+            created_at, completed_at, expires_at, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(batch_id) DO UPDATE SET
+            status=excluded.status,
+            total_files=excluded.total_files,
+            completed_files=excluded.completed_files,
+            results_json=excluded.results_json,
+            completed_at=excluded.completed_at,
+            expires_at=excluded.expires_at,
+            error=excluded.error
+        """,
+        (
+            batch_id,
+            batch.get("status", "processing"),
+            int(batch.get("total_files", 0)),
+            int(batch.get("completed_files", 0)),
+            json.dumps(batch.get("results", []), ensure_ascii=False),
+            float(batch.get("created_at", time.time())),
+            batch.get("completed_at"),
+            batch.get("expires_at"),
+            batch.get("error"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_api_batch(batch_id: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM api_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    result["results"] = json.loads(result.pop("results_json") or "[]")
+    return result
+
+
+def reconcile_interrupted_jobs(reason: str) -> dict[str, int]:
+    """Move work orphaned by a process restart to a stable terminal state."""
+    now = time.time()
+    conn = _get_conn()
+    ui_ids = [
+        row["job_id"]
+        for row in conn.execute(
+            "SELECT job_id FROM jobs WHERE status IN ('analyzing', 'processing')"
+        ).fetchall()
+    ]
+    api_count = conn.execute(
+        """
+        UPDATE api_jobs
+        SET status='interrupted', completed_at=?, expires_at=COALESCE(expires_at, ?),
+            error=COALESCE(error, ?)
+        WHERE status='processing'
+        """,
+        (now, now + 3600, reason),
+    ).rowcount
+    batch_count = conn.execute(
+        """
+        UPDATE api_batches
+        SET status='interrupted', completed_at=?, expires_at=COALESCE(expires_at, ?),
+            error=COALESCE(error, ?)
+        WHERE status='processing'
+        """,
+        (now, now + 3600, reason),
+    ).rowcount
+    if ui_ids:
+        placeholders = ",".join("?" for _ in ui_ids)
+        conn.execute(
+            f"UPDATE jobs SET status='interrupted', completed_at=?, error=COALESCE(error, ?) "
+            f"WHERE job_id IN ({placeholders})",
+            (now, reason, *ui_ids),
+        )
+        conn.execute(
+            f"UPDATE page_results SET status='failed', error=COALESCE(error, ?) "
+            f"WHERE status IN ('analyzing', 'processing') AND job_id IN ({placeholders})",
+            (reason, *ui_ids),
+        )
+    conn.commit()
+    conn.close()
+    return {"ui": len(ui_ids), "api": api_count, "batch": batch_count}
+
+
+def cleanup_expired_api_records(now: float | None = None) -> dict[str, int]:
+    """Delete expired persisted API results and return removal counts."""
+    cutoff = now if now is not None else time.time()
+    conn = _get_conn()
+    api_count = conn.execute(
+        "DELETE FROM api_jobs WHERE expires_at IS NOT NULL AND expires_at <= ?", (cutoff,)
+    ).rowcount
+    batch_count = conn.execute(
+        "DELETE FROM api_batches WHERE expires_at IS NOT NULL AND expires_at <= ?", (cutoff,)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return {"api": api_count, "batch": batch_count}
+
+
+# ── Client / IP Quota Rate Limiting ──────────────────────────
+
+def check_and_increment_client_quota(client_id: str, page_count: int, max_pages: int = 5, max_daily: int = 5) -> dict:
+    """
+    Check if a client IP has quota remaining for today (Vietnam UTC+7 timezone).
+    Returns usage stats dict or raises ValueError.
+    """
+    if page_count > max_pages:
+        raise ValueError(f"Bản miễn phí chỉ cho phép tối đa {max_pages} trang mỗi lần OCR (bạn đang gửi {page_count} trang).")
+
+    from datetime import datetime, timedelta, timezone
+    vn_now = datetime.now(timezone(timedelta(hours=7)))
+    today_str = vn_now.strftime("%Y-%m-%d")
+
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT request_count, total_pages FROM client_quotas WHERE client_id = ? AND usage_date = ?",
+        (client_id, today_str)
+    ).fetchone()
+
+    current_count = row["request_count"] if row else 0
+
+    if current_count >= max_daily:
+        conn.close()
+        midnight = vn_now.replace(hour=23, minute=59, second=59)
+        rem_secs = max(0, int((midnight - vn_now).total_seconds()))
+        rem_hrs = rem_secs // 3600
+        rem_mins = (rem_secs % 3600) // 60
+        raise PermissionError(f"Thiết bị của bạn đã dùng hết {max_daily}/{max_daily} lượt OCR miễn phí hôm nay. Lượt mới sẽ tự động làm mới vào 00:00 (còn khoảng {rem_hrs} giờ {rem_mins} phút).")
+
+    new_count = current_count + 1
+    new_pages = (row["total_pages"] if row else 0) + page_count
+
+    conn.execute("""
+        INSERT OR REPLACE INTO client_quotas (client_id, usage_date, request_count, total_pages, last_request_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (client_id, today_str, new_count, new_pages, time.time()))
+    conn.commit()
+    conn.close()
+
+    return {
+        "client_id": client_id,
+        "date": today_str,
+        "used": new_count,
+        "remaining": max_daily - new_count,
+        "max_daily": max_daily,
+    }
+
+
+def get_client_quota(client_id: str, max_daily: int = 5) -> dict:
+    """Get current day quota usage for a client."""
+    from datetime import datetime, timedelta, timezone
+    vn_now = datetime.now(timezone(timedelta(hours=7)))
+    today_str = vn_now.strftime("%Y-%m-%d")
+
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT request_count, total_pages FROM client_quotas WHERE client_id = ? AND usage_date = ?",
+        (client_id, today_str)
+    ).fetchone()
+    conn.close()
+
+    used = row["request_count"] if row else 0
+    return {
+        "client_id": client_id,
+        "date": today_str,
+        "used": used,
+        "remaining": max(0, max_daily - used),
+        "max_daily": max_daily,
+    }
 
 
 # ── Job CRUD ─────────────────────────────────────────────────
@@ -183,7 +461,7 @@ def list_jobs_from_db() -> list[dict]:
         """, (row["job_id"],)).fetchone()
 
         selected = json.loads(row["selected_pages"]) if row["selected_pages"] else []
-        elapsed = round((row["completed_at"] or 0) - (row["started_at"] or 0), 2) if row["started_at"] else 0
+        elapsed = round((row["completed_at"] or time.time()) - row["started_at"], 2) if row["started_at"] else 0
 
         results.append({
             "job_id": row["job_id"],
@@ -222,13 +500,19 @@ def delete_job_from_db(job_id: str) -> bool:
     conn.commit()
     conn.close()
 
-    # Clean up file
+    # Clean up file and extracted images
     filepath = row["filepath"]
     if filepath and os.path.exists(filepath):
         try:
             os.remove(filepath)
         except OSError:
             pass
+
+    upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads"))
+    img_dir = upload_dir / "extracted_images" / job_id
+    if img_dir.exists():
+        shutil.rmtree(img_dir, ignore_errors=True)
+
     return True
 
 
@@ -243,6 +527,7 @@ def cleanup_expired_jobs(max_age_days: int = 7) -> dict:
     deleted = 0
     files_removed = 0
     bytes_freed = 0
+    upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads"))
 
     for row in rows:
         job_id = row["job_id"]
@@ -261,6 +546,15 @@ def cleanup_expired_jobs(max_age_days: int = 7) -> dict:
                 bytes_freed += fsize
             except OSError:
                 pass
+
+        # Delete extracted images directory
+        img_dir = upload_dir / "extracted_images" / job_id
+        if img_dir.exists():
+            try:
+                shutil.rmtree(img_dir, ignore_errors=True)
+            except OSError:
+                pass
+
         deleted += 1
 
     conn.commit()

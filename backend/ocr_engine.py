@@ -4,6 +4,7 @@ import base64
 import io
 import os
 import time
+from pathlib import Path
 
 import bleach
 import httpx
@@ -11,7 +12,11 @@ import pytesseract
 from dotenv import load_dotenv
 from PIL import Image
 
-load_dotenv()
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE)
+else:
+    load_dotenv()
 
 # Global Semaphores for Concurrency Control
 _semaphores = {}
@@ -28,18 +33,18 @@ def get_tesseract_semaphore():
         _semaphores["tesseract"] = asyncio.Semaphore(workers)
     return _semaphores["tesseract"]
 
-CONFIDENCE_THRESHOLD = int(os.getenv("CONFIDENCE_THRESHOLD", "80"))
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4-mini")
-TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng+vie")
-
-
-def _require_vision_config() -> None:
-    if not OPENAI_BASE_URL or not OPENAI_API_KEY:
+def get_vision_config():
+    base_url = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    model = os.getenv("VISION_MODEL", "image-vision")
+    if not base_url or not api_key:
         raise RuntimeError(
             "Vision OCR is not configured; set OPENAI_BASE_URL and OPENAI_API_KEY at runtime"
         )
+    return base_url, api_key, model
+
+CONFIDENCE_THRESHOLD = int(os.getenv("CONFIDENCE_THRESHOLD", "80"))
+TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng+vie")
 
 ALLOWED_HTML_TAGS = {
     "div", "span", "p", "pre", "br", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -100,18 +105,27 @@ def tesseract_ocr(image: Image.Image, lang: str = None) -> dict:
     }
 
 
+def _image_to_base64(image: Image.Image, max_dim: int = 1500, quality: int = 85) -> str:
+    """Convert PIL image to compact JPEG base64 to keep payload light (<200KB per page)."""
+    img = image.copy()
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    if max(img.size) > max_dim:
+        img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
 async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
     """Run OCR through an OpenAI-compatible Vision endpoint.
     
     HTML-first approach: one API call for HTML, derive plain text from it.
     """
-    _require_vision_config()
+    openai_base_url, openai_api_key, vision_model = get_vision_config()
     start = time.time()
 
-    # Convert image to base64
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    img_b64 = base64.b64encode(buffer.getvalue()).decode()
+    img_b64 = _image_to_base64(image)
 
     html_prompt = (
         "Extract ALL text from this image and output as clean HTML that preserves "
@@ -125,7 +139,7 @@ async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
     )
 
     payload = {
-        "model": VISION_MODEL,
+        "model": vision_model,
         "messages": [
             {
                 "role": "user",
@@ -133,7 +147,7 @@ async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
                     {"type": "text", "text": html_prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"},
                     },
                 ],
             }
@@ -143,12 +157,13 @@ async def _vision_ocr_unlimited(image: Image.Image, prompt: str = None) -> dict:
         "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    timeout = httpx.Timeout(120.0, connect=30.0, read=120.0, write=60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
-            f"{OPENAI_BASE_URL}/chat/completions",
+            f"{openai_base_url}/chat/completions",
             json=payload,
             headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Authorization": f"Bearer {openai_api_key}",
                 "Content-Type": "application/json",
             },
         )
@@ -228,7 +243,7 @@ async def _vision_ocr_batch_unlimited(images: list[tuple[int, Image.Image]]) -> 
     """
     if not images:
         return []
-    _require_vision_config()
+    openai_base_url, openai_api_key, vision_model = get_vision_config()
     if len(images) == 1:
         result = await _vision_ocr_unlimited(images[0][1])
         return [result]
@@ -253,16 +268,14 @@ async def _vision_ocr_batch_unlimited(images: list[tuple[int, Image.Image]]) -> 
     ]
 
     for _page_num, image in images:
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        img_b64 = base64.b64encode(buffer.getvalue()).decode()
+        img_b64 = _image_to_base64(image)
         content_parts.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"},
         })
 
     payload = {
-        "model": VISION_MODEL,
+        "model": vision_model,
         "messages": [{"role": "user", "content": content_parts}],
         "max_tokens": 24576,
         "temperature": 0,
@@ -270,12 +283,13 @@ async def _vision_ocr_batch_unlimited(images: list[tuple[int, Image.Image]]) -> 
     }
 
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
+        timeout = httpx.Timeout(180.0, connect=30.0, read=180.0, write=60.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
-                f"{OPENAI_BASE_URL}/chat/completions",
+                f"{openai_base_url}/chat/completions",
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Authorization": f"Bearer {openai_api_key}",
                     "Content-Type": "application/json",
                 },
             )

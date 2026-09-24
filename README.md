@@ -151,6 +151,8 @@ secret manager.
 | `MAX_PDF_PAGES` | Reject unexpectedly long documents |
 | `MAX_CONCURRENT_JOBS` | Bound total OCR CPU and memory pressure |
 | `JOB_MAX_AGE_DAYS` | Application job retention |
+| `API_JOB_RETENTION_SECONDS` | Completed API/batch result retention; defaults to one hour |
+| `SHUTDOWN_GRACE_SECONDS` | Time allowed for active OCR tasks to finish during restart |
 | `SMART_PDF_CLEANUP_DAYS` | File cleanup timer retention |
 | `SMART_PDF_BACKUP_DAYS` | Backup retention |
 
@@ -205,8 +207,10 @@ curl --fail-with-body \
   "${SMARTPDF_URL}/api/v1/ocr?pages=all&method=auto&extract_images=false"
 ```
 
-The response includes a `job_id` and `poll_url`. API jobs are kept in memory for
-one hour after completion; persist downloaded results in the calling workflow.
+The response includes a `job_id` and `poll_url`. API and batch progress/results
+are persisted in SQLite for one hour by default, so completed results survive a
+service restart. Work still running when shutdown grace expires becomes
+`interrupted` and must be submitted again.
 
 ## MCP server
 
@@ -341,7 +345,8 @@ pnpm --dir mcp-server audit --audit-level high
 
 ## Known operational boundaries
 
-- Active API/batch job state is in memory and is lost on a service restart.
+- Completed API/batch results survive restarts; unfinished work is marked
+  `interrupted` after the configured shutdown grace and is not retried automatically.
 - SQLite persists UI job history, but backup restoration is an operator action.
 - Vision quality, latency and cost depend on the configured external model.
 - Tesseract language packs must be installed at the OS level.

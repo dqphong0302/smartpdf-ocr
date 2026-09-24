@@ -94,13 +94,12 @@ test("MCP handshake exposes strict schemas, structured output, and annotations",
   assert.equal(invalid.isError, true);
 });
 
-test("API-key job status and download never fall through to session endpoints", async (t) => {
+test("explicit API job kind avoids ambiguous batch and session probes", async (t) => {
   const directory = await makeTempDir(t);
   const outputPath = path.join(directory, "result.html");
   const calls = [];
   const fetchImpl = async (url) => {
     calls.push(url);
-    if (url.includes("/api/v1/ocr/batch/job-123")) return jsonResponse({ detail: "not found" }, 404);
     if (url.includes("/api/v1/ocr/job-123")) {
       return new Response("<html><body><h1>Internal result</h1></body></html>", {
         headers: { "content-type": "text/html" },
@@ -115,18 +114,39 @@ test("API-key job status and download never fall through to session endpoints", 
   });
   const runtime = createRuntime(config, { fetchImpl });
 
-  const status = await runtime.handleTool("ocr_status", { id: "job-123", include_text: true });
+  const status = await runtime.handleTool("ocr_status", { id: "job-123", kind: "job", include_text: true });
   assert.equal(status.status, "completed");
   assert.equal(status.text, "Internal result");
 
   const downloaded = await runtime.handleTool("ocr_download", {
     id: "job-123",
+    kind: "job",
     format: "html",
     output_path: outputPath,
   });
   assert.equal(downloaded.output_path, path.join(realpathSync(directory), "result.html"));
   assert.match(await fs.readFile(outputPath, "utf8"), /Internal result/);
+  assert.equal(calls.some((url) => url.includes("/api/v1/ocr/batch/")), false);
   assert.equal(calls.some((url) => url.includes("/api/auth/login") || url.includes("/api/download/")), false);
+});
+
+test("explicit batch kind uses only the batch status route", async () => {
+  const calls = [];
+  const config = loadConfig({
+    SMART_OCR_URL: "https://ocr.example.test",
+    SMART_OCR_API_KEY: "test-placeholder", // pragma: allowlist secret
+  });
+  const runtime = createRuntime(config, {
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return jsonResponse({ batch_id: "batch-123", status: "interrupted" });
+    },
+  });
+
+  const result = await runtime.handleTool("ocr_status", { id: "batch-123", kind: "batch" });
+  assert.equal(result.status, "interrupted");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /\/api\/v1\/ocr\/batch\/batch-123$/);
 });
 
 test("batch submit validates files and splits more than ten PDFs", async (t) => {

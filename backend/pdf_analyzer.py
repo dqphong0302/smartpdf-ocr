@@ -283,3 +283,59 @@ def extract_page_images(filepath: str, page_num: int, output_dir: str) -> list[s
     doc.close()
     return saved_files
 
+
+def extract_pdf_metadata(filepath: str) -> dict:
+    """Extract zero-token academic metadata, DOI, arXiv, PMID, and text structure from PDF."""
+    import re
+    doc = fitz.open(filepath)
+    meta = doc.metadata or {}
+    total_pages = len(doc)
+    
+    first_pages_text = ""
+    for p_idx in range(min(3, total_pages)):
+        first_pages_text += doc[p_idx].get_text("text") + "\n"
+    
+    doc.close()
+
+    # Extract DOI using standard regex
+    doi_match = re.search(r'\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\b', first_pages_text)
+    doi = doi_match.group(1).rstrip('.,;)') if doi_match else None
+
+    # Extract arXiv ID
+    arxiv_match = re.search(r'\barXiv:\s*(\d{4}\.\d{4,5}(?:v\d+)?)\b', first_pages_text, re.IGNORECASE)
+    arxiv_id = arxiv_match.group(1) if arxiv_match else None
+
+    # Extract PMID
+    pmid_match = re.search(r'\bPMID:\s*(\d{5,9})\b', first_pages_text, re.IGNORECASE)
+    pmid = pmid_match.group(1) if pmid_match else None
+
+    # Extract abstract preview if present
+    abstract = None
+    abstract_match = re.search(r'(?:Abstract|TÓM TẮT)\s*[:\-\n]([\s\S]{50,1500}?)(?=\n\s*(?:Keywords|Từ khóa|Introduction|1\.|\n\n))', first_pages_text, re.IGNORECASE)
+    if abstract_match:
+        abstract = " ".join(abstract_match.group(1).split()).strip()
+
+    title = meta.get("title") or ""
+    if not title or len(title.strip()) < 5:
+        # Fallback to the first non-empty lines on page 1
+        lines = [l.strip() for l in first_pages_text.split("\n") if len(l.strip()) > 5]
+        if lines:
+            title = lines[0]
+
+    return {
+        "title": title.strip() if title else None,
+        "author": meta.get("author") or None,
+        "subject": meta.get("subject") or None,
+        "keywords": meta.get("keywords") or None,
+        "creator": meta.get("creator") or None,
+        "producer": meta.get("producer") or None,
+        "creation_date": meta.get("creationDate") or None,
+        "mod_date": meta.get("modDate") or None,
+        "total_pages": total_pages,
+        "doi": doi,
+        "arxiv_id": arxiv_id,
+        "pmid": pmid,
+        "abstract": abstract,
+    }
+
+

@@ -39,6 +39,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "OCR_API_KEY", "test-api-key-long")
     main.job_manager._jobs.clear()
     main.job_manager._websockets.clear()
+    main._api_jobs.clear()
+    main._batch_jobs.clear()
     database.init_db()
     auth.init_auth_tables()
     auth.seed_default_user("test-admin", "test-password-long")
@@ -84,12 +86,87 @@ def test_login_uses_secure_cookie_and_unlocks_jobs(client):
 
 
 def test_programmatic_routes_require_api_key(client):
+    assert client.post(
+        "/api/v1/ocr",
+        files={"file": ("test.pdf", b"not-a-pdf", "application/pdf")},
+    ).status_code == 401
     assert client.get("/api/health/details").status_code == 401
     response = client.get(
         "/api/health/details", headers={"X-API-Key": "test-api-key-long"}
     )
     assert response.status_code == 200
     assert response.json()["checks"]["vision"]["ok"] is True
+
+
+def test_api_result_survives_memory_cache_loss(client):
+    now = main.time.time()
+    database.save_api_job(
+        "durable-job",
+        {
+            "filename": "durable.pdf",
+            "filepath": "",
+            "status": "completed",
+            "total_pages": 1,
+            "completed_pages": 1,
+            "selected_pages": [1],
+            "method": "digital",
+            "pages": {
+                "1": {
+                    "text": "durable text",
+                    "html_text": "<p>durable text</p>",
+                    "method": "digital",
+                    "confidence": 100,
+                }
+            },
+            "html_result": "<html><body>durable text</body></html>",
+            "created_at": now,
+            "started_at": now,
+            "completed_at": now,
+            "expires_at": now + 3600,
+            "error": None,
+        },
+    )
+    main._api_jobs.clear()
+
+    response = client.get(
+        "/api/v1/ocr/durable-job",
+        headers={"X-API-Key": "test-api-key-long"},
+    )
+    assert response.status_code == 200
+    assert "durable text" in response.text
+
+
+def test_restart_reconciliation_and_active_elapsed(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "recovery.db")
+    database.init_db()
+    conn = database._get_conn()
+    now = main.time.time()
+    conn.execute(
+        """
+        INSERT INTO jobs (
+            job_id, filename, filepath, status, total_pages, selected_pages,
+            created_at, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("ui-active", "active.pdf", "", "processing", 1, "[1]", now - 10, now - 5),
+    )
+    conn.execute(
+        """
+        INSERT INTO api_jobs (
+            job_id, filename, status, total_pages, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        ("api-active", "active.pdf", "processing", 1, now),
+    )
+    conn.commit()
+    conn.close()
+
+    active = database.list_jobs_from_db()[0]
+    assert active["elapsed_time"] >= 0
+    recovered = database.reconcile_interrupted_jobs("restart test")
+    assert recovered == {"ui": 1, "api": 1, "batch": 0}
+    assert database.load_job_dict("ui-active")["status"] == "interrupted"
+    assert database.load_api_job("api-active")["status"] == "interrupted"
 
 
 def test_latex_is_disabled_by_default(client):

@@ -21,6 +21,7 @@ class JobStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
 
 class PageMethod(StrEnum):
@@ -218,7 +219,7 @@ class JobManager:
         job.status = status
         if status == JobStatus.PROCESSING and not job.started_at:
             job.started_at = time.time()
-        if status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        if status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.INTERRUPTED):
             job.completed_at = time.time()
         # Persist to SQLite
         save_job(job)

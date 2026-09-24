@@ -135,13 +135,16 @@ containing more than 10 PDFs is split into backend-compatible chunks and returns
 Exactly one of `id` or `ids` is required. Use `ids` with the `batch_ids` returned
 by a split submission. Poll no more frequently than every two seconds.
 `include_text=true` returns full text for completed API jobs; UI jobs require
-session credentials.
+session credentials. Pass `kind=job`, `kind=batch`, or `kind=ui` when the ID type
+is known to avoid fallback probes. A restarted unfinished job reports
+`interrupted`; resubmit it rather than polling indefinitely.
 
 ### `ocr_download`
 
 Downloads a completed result and always writes it to disk. Prefer an absolute
 `output_path`; otherwise the current working directory is used. Existing files
-are protected unless `overwrite=true`.
+are protected unless `overwrite=true`. The optional `kind` field accepts
+`job`, `batch`, or `ui` and selects the matching endpoint directly.
 
 - API job: `html`, `txt`, `text`, `md`, or `markdown`
 - UI job: `txt`, `text`, `html`, `md`, `markdown`, or `docx`
