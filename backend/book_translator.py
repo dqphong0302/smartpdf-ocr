@@ -90,7 +90,7 @@ def get_llm_config() -> tuple[str, str, str]:
 # ============================================================================
 
 class DomainGlossaryManager:
-    """Manages domain-specific terminology glossaries and dynamic prompt injection."""
+    """Manages domain-specific terminology glossaries, multi-format loading, and dynamic prompt injection."""
 
     def __init__(self, glossaries_dir: Path | None = None):
         self.glossaries_dir = glossaries_dir or (Path(__file__).parent / "data" / "glossaries")
@@ -98,48 +98,222 @@ class DomainGlossaryManager:
         self._load_glossaries()
 
     def _load_glossaries(self):
-        """Load JSON/JSONL glossary files into memory."""
+        """Load JSON, JSONL, and CSV glossary files into memory."""
         if not self.glossaries_dir.exists():
             return
 
+        # 1. Load JSON files
         for f in self.glossaries_dir.glob("*.json"):
             try:
                 with open(f, "r", encoding="utf-8") as fp:
                     data = json.load(fp)
                     if isinstance(data, dict):
                         self._cache[f.stem.lower()] = {k.lower().strip(): v.strip() for k, v in data.items()}
+                        logger.info("Loaded %d terms from %s", len(self._cache[f.stem.lower()]), f.name)
             except Exception as e:
-                logger.warning("Error loading glossary file %s: %s", f, e)
+                logger.warning("Error loading glossary JSON %s: %s", f, e)
 
-    def get_matching_terms(self, text: str, profile: str) -> dict[str, str]:
-        """Find domain terms present in text, prioritizing longer phrases."""
-        profile = profile.lower()
-        terms = self._cache.get(profile, {})
-        if not terms:
-            # Fallback to check alias
-            if profile in ("engineering", "technical"):
-                terms = self._cache.get("tech", {})
+        # 2. Load JSONL files (AegisTrans format)
+        for f in self.glossaries_dir.glob("*.jsonl"):
+            try:
+                entries: dict[str, str] = {}
+                with open(f, "r", encoding="utf-8") as fp:
+                    for line in fp:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                            k = item.get("en") or item.get("term") or item.get("source")
+                            v = item.get("vi") or item.get("translation") or item.get("target")
+                            if k and v:
+                                entries[k.lower().strip()] = v.strip()
+                        except Exception:
+                            continue
+                if entries:
+                    stem = f.stem.lower()
+                    self._cache.setdefault(stem, {}).update(entries)
+                    logger.info("Loaded %d terms from %s", len(entries), f.name)
+            except Exception as e:
+                logger.warning("Error loading glossary JSONL %s: %s", f, e)
 
-        if not terms:
-            return {}
+        # 3. Load CSV files
+        for f in self.glossaries_dir.glob("*.csv"):
+            try:
+                import csv
+                entries = {}
+                with open(f, "r", encoding="utf-8") as fp:
+                    reader = csv.reader(fp)
+                    for row in reader:
+                        if len(row) >= 2 and row[0].strip() and row[1].strip():
+                            entries[row[0].lower().strip()] = row[1].strip()
+                if entries:
+                    stem = f.stem.lower()
+                    self._cache.setdefault(stem, {}).update(entries)
+                    logger.info("Loaded %d terms from %s", len(entries), f.name)
+            except Exception as e:
+                logger.warning("Error loading glossary CSV %s: %s", f, e)
 
+    def register_glossary(self, profile: str, terms: dict[str, str]):
+        """Dynamically register or update an in-memory glossary profile."""
+        profile = profile.lower().strip()
+        normalized = {k.lower().strip(): v.strip() for k, v in terms.items()}
+        if profile in self._cache:
+            self._cache[profile].update(normalized)
+        else:
+            self._cache[profile] = normalized
+        logger.info("Registered glossary '%s' with %d terms", profile, len(normalized))
+
+    def get_matching_terms(
+        self,
+        text: str,
+        profile: str = "general",
+        book_id: str | None = None,
+    ) -> dict[str, str]:
+        """Find domain terms present in text, prioritizing book-specific terms and longer phrases."""
         text_lower = text.lower()
         matched: dict[str, str] = {}
 
+        # Merge candidate terms from: 1. book-specific glossary, 2. domain profile
+        combined_terms: dict[str, str] = {}
+
+        # Add domain profile terms
+        profile = profile.lower()
+        if profile in ("engineering", "technical"):
+            profile = "tech"
+
+        if profile in self._cache:
+            combined_terms.update(self._cache[profile])
+
+        # Add book-specific terms with priority
+        if book_id:
+            book_key = f"book_{book_id.lower()}"
+            if book_key in self._cache:
+                combined_terms.update(self._cache[book_key])
+
+        if not combined_terms:
+            return {}
+
         # Sort terms by length descending to match composite multi-word terms first
-        sorted_terms = sorted(terms.keys(), key=len, reverse=True)
+        sorted_terms = sorted(combined_terms.keys(), key=len, reverse=True)
         for term in sorted_terms:
-            # Word boundary check for high precision
             pattern = r"\b" + re.escape(term) + r"\b"
             if re.search(pattern, text_lower):
-                matched[term] = terms[term]
-                if len(matched) >= 30:  # Cap at 30 top relevant terms to preserve prompt budget
+                matched[term] = combined_terms[term]
+                if len(matched) >= 35:  # Cap at 35 top relevant terms per prompt
                     break
 
         return matched
 
+    async def auto_mine_book_glossary(
+        self,
+        doc: fitz.Document,
+        book_id: str,
+        max_sample_pages: int = 8,
+        client: httpx.AsyncClient | None = None,
+    ) -> dict[str, str]:
+        """Pass 1 Term Mining (AegisTrans Architecture):
+
+        Scans Table of Contents and representative sample pages of a book to discover
+        book-specific nomenclature, acronyms, and specialized jargon before translation.
+        """
+        total_pages = doc.page_count
+        if total_pages == 0:
+            return {}
+
+        # Sample TOC, first 3 pages, middle pages, and last pages (index)
+        sample_indices = set()
+        for i in range(min(4, total_pages)):
+            sample_indices.add(i)
+        if total_pages > 10:
+            sample_indices.add(total_pages // 2)
+            sample_indices.add(total_pages // 2 + 1)
+        if total_pages > 6:
+            sample_indices.add(total_pages - 2)
+            sample_indices.add(total_pages - 1)
+
+        sample_pages = sorted(list(sample_indices))[:max_sample_pages]
+
+        combined_sample_text = ""
+        for p_idx in sample_pages:
+            try:
+                page_text = doc[p_idx].get_text()
+                if page_text:
+                    # Clip to 1500 chars per page to avoid context blowout
+                    combined_sample_text += f"\n--- Page {p_idx + 1} ---\n" + page_text[:1500]
+            except Exception:
+                continue
+
+        if not combined_sample_text.strip():
+            return {}
+
+        base_url, api_key, model = get_llm_config()
+        system_prompt = (
+            "You are an expert academic terminologist and terminology extractor. "
+            "Analyze the following textbook excerpt (TOC, chapters, index). "
+            "Extract up to 40 of the most critical domain-specific terms, proper nouns, clinical/technical concepts, "
+            "and author abbreviations. "
+            "For each term, provide its standardized academic Vietnamese translation WITH the original English term in parentheses: "
+            "'Thuật ngữ tiếng Việt chuẩn (English term)'. "
+            "Output MUST be valid JSON in this schema:\n"
+            '{"glossary": {"<english_term>": "<vietnamese_translation (english_term)>"}}'
+        )
+
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+            close_client = True
+
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Textbook sample excerpt:\n{combined_sample_text[:6000]}"},
+                ],
+            }
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+
+            raw_text = resp.text.strip()
+            content = ""
+            if "data:" in raw_text:
+                for line in raw_text.splitlines():
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        payload_str = line[5:].strip()
+                        if payload_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload_str)
+                            content += chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        except Exception:
+                            continue
+            else:
+                content = resp.json()["choices"][0]["message"]["content"]
+
+            parsed = _clean_and_parse_json(content)
+            extracted = parsed.get("glossary", {})
+            if isinstance(extracted, dict) and extracted:
+                self.register_glossary(f"book_{book_id}", extracted)
+                logger.info("Successfully auto-mined %d book-specific terms for %s", len(extracted), book_id)
+                return extracted
+
+        except Exception as e:
+            logger.warning("Pass 1 Auto-term mining failed for book %s: %s", book_id, e)
+        finally:
+            if close_client:
+                await client.aclose()
+
+        return {}
+
 
 glossary_manager = DomainGlossaryManager()
+
 
 SPECIALTY_PROMPTS = {
     "medical": (
@@ -218,6 +392,7 @@ async def translate_text_blocks(
     glossary_profile: str = "general",
     custom_model: str | None = None,
     client: httpx.AsyncClient | None = None,
+    book_id: str | None = None,
 ) -> list[str]:
     """Translate a list of text blocks concurrently using 9router GPT model with dynamic terminology injection."""
     if not blocks:
@@ -228,7 +403,7 @@ async def translate_text_blocks(
 
     # Combine text for dynamic glossary scan
     combined_source = " \n ".join(b.get("text", "") for b in blocks)
-    matched_glossary = glossary_manager.get_matching_terms(combined_source, glossary_profile)
+    matched_glossary = glossary_manager.get_matching_terms(combined_source, glossary_profile, book_id=book_id)
 
     glossary_constraint_prompt = ""
     if matched_glossary:
@@ -644,6 +819,14 @@ async def translate_pdf_book(
                 model or "default",
             )
 
+            book_id = input_pdf_path.stem
+
+            # Pass 1: Auto-mine book-specific terminology if multi-page document
+            if len(target_pages) >= 2:
+                if progress_callback:
+                    await progress_callback(0, len(target_pages), "Đang quét thuật ngữ sách chuyên ngành (Pass 1 Term Mining)...")
+                await glossary_manager.auto_mine_book_glossary(doc, book_id, client=http_client)
+
             if progress_callback:
                 await progress_callback(0, len(target_pages), "Đang phân tích layout và khởi tạo glossary chuyên ngành...")
 
@@ -673,6 +856,7 @@ async def translate_pdf_book(
                             glossary_profile=glossary_profile,
                             custom_model=model,
                             client=http_client,
+                            book_id=book_id,
                         )
                         _typeset_page_blocks(new_page, blocks, translated_texts, fonts, image_rects)
                         translated_blocks_count += len(blocks)
@@ -705,6 +889,7 @@ async def translate_pdf_book(
                             glossary_profile=glossary_profile,
                             custom_model=model,
                             client=http_client,
+                            book_id=book_id,
                         )
                         _typeset_page_blocks(page, blocks, translated_texts, fonts, image_rects)
                         translated_blocks_count += len(blocks)
