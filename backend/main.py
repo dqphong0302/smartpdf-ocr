@@ -1083,7 +1083,7 @@ async def start_book_translation(
     payload: TranslationPayload | None = None,
     mode: str = Query(default="inplace", description="inplace | bilingual_dual"),
     glossary_profile: str = Query(default="general", description="general | medical | dental | tech"),
-    model: str = Query(default=None, description="GPT model from 9router (e.g. gpt-5.6-luna)"),
+    model: str = Query(default=None, description="GPT model from 9router (e.g. gpt-luna)"),
     pages: list[int] = Query(default=None, description="Page numbers to translate (1-indexed)"),
     _user: str = Depends(require_auth),
 ):
@@ -1116,7 +1116,7 @@ async def start_book_translation(
         "job_id": job_id,
         "mode": effective_mode,
         "glossary_profile": effective_profile,
-        "model": effective_model or os.getenv("SMART_PDF_GPT_MODEL", "gpt-5.6-luna"),
+        "model": effective_model or os.getenv("SMART_PDF_GPT_MODEL", "gpt-luna"),
         "selected_pages": selected,
         "total_selected": len(selected),
     }
@@ -1189,9 +1189,9 @@ async def list_available_gpt_models():
         "base_url": base_url,
         "configured": bool(base_url and api_key),
         "supported_models": [
+            "gpt-luna",
             "gh/gpt-5.4-mini",
             "gh/gpt-5.4",
-            "gpt-5.6-luna",
             "model-chinh",
             "image-vision",
         ],

@@ -78,7 +78,7 @@ def get_llm_config() -> tuple[str, str, str]:
         os.getenv("SMART_PDF_GPT_MODEL")
         or os.getenv("TRANSLATION_MODEL")
         or os.getenv("GPT_MODEL")
-        or "gpt-5.6-luna"
+        or "gpt-luna"
     )
     if not api_key:
         logger.warning("OPENAI_API_KEY is not set. 9router authentication might fail.")

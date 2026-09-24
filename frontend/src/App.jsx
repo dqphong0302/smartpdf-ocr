@@ -49,8 +49,8 @@ export default function App() {
   const [translateMode, setTranslateMode] = useState('inplace') // 'inplace' | 'bilingual_dual'
   const [glossaryProfile, setGlossaryProfile] = useState('general') // 'general' | 'medical' | 'dental' | 'tech'
   const [availableGlossaries, setAvailableGlossaries] = useState([])
-  const [selectedModel, setSelectedModel] = useState('gpt-5.6-luna')
-  const [availableModels, setAvailableModels] = useState(['gpt-5.6-luna', 'gh/gpt-5.4-mini', 'gh/gpt-5.4'])
+  const [selectedModel, setSelectedModel] = useState('gpt-luna')
+  const [availableModels, setAvailableModels] = useState(['gpt-luna', 'gh/gpt-5.4-mini', 'gh/gpt-5.4'])
   const [autoMineGlossary, setAutoMineGlossary] = useState(true)
   const [rangeMode, setRangeMode] = useState('all') // 'all' | 'custom'
   const [customRangeInput, setCustomRangeInput] = useState('')
@@ -777,7 +777,7 @@ export default function App() {
                             style={{ width: '100%', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)' }}
                           >
                             {availableModels.map(m => (
-                              <option key={m} value={m}>{m} {m === 'gpt-5.6-luna' ? '(Khuyên dùng)' : ''}</option>
+                              <option key={m} value={m}>{m} {m === 'gpt-luna' ? '(Khuyên dùng)' : ''}</option>
                             ))}
                           </select>
                         </div>
